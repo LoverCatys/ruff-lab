@@ -1,0 +1,14 @@
+# Never commit game files, binaries, dumps, or raw crash artifacts
+*.exe
+*.dll
+*.rpf
+*.ttpf
+*.xvd
+*.bin
+*.dmp
+*.log
+*.zip
+*.7z
+*.rar
+*.torrent
+victory.toml
