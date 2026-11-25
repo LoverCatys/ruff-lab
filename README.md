@@ -26,19 +26,20 @@
 | **GPU Driver** | AMD Software: Adrenalin Edition **26.11.2** (`32.0.21045.29003`) |
 | **RAM** | 16 GB DDR4 (32 GB total virtual / pagefile) |
 | **Storage (Game)** | 500 GB SATA HDD (`WDC WD5000LPCX-00VHAT0`, 5400 RPM) |
-| **Runtime Layer** | [PastiiJay/klbf-lab](https://github.com/PastiiJay/klbf-lab) (fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory)) |
+| **Runtime Layer** | [PastiiJay/klbf-lab-beta](https://github.com/PastiiJay/klbf-lab-beta) (`klbf-amd` / **Lab 39**, commit `0ad4037`, fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory)) |
 | **Upscaler** | AMD FidelityFX SDK v2.4.0 (`amd_fidelityfx_loader_dx12.dll`) |
 
 ---
 
-## Current Status
+## Current Status (2026-11-25)
 
 | Stage | Status | Notes |
 |---|---|---|
 | Build & PE/HLE verification | ✅ Passed | `victory.exe` built cleanly with Rust `1.98.1` (`x86_64-pc-windows-msvc`); all 587 imports resolved |
-| Boot & D3D12 init | ⏳ Testing | Pending clean 100% dump test |
-| Menus & Intro | ⏳ Pending | — |
-| Prologue (in-world) | ⏳ Pending | — |
+| Boot & D3D12 init | ✅ Works | Native Wave64 detected (`min=32 max=64 compute=64`); ~0.5–1.2 ms GPU time |
+| First-boot setup, menus & HUD (`series-s` + FSR) | ✅ Works | **30.0 fps**; setup screens, character loading art & spinner render cleanly in Lab 39 |
+| World loading (from 5400 RPM HDD) | ✅ Reaches world | Reaches `Game Running` / Mission `0x98c85f2a` (`TileHeap 2090/3977 MB`, RAM `5.88 GB` / commit `8.66 GB`); ~12–14 min on HDD |
+| Prologue (in-world) | ⏳ Next | Hit 30 s RAGE watchdog (`+0x23cf683 → +0x2215c35`) on first world frame while compiling pipelines on the fly (`VICTORY_PIPELINE_GATE_S`); zero `amdxc64.dll` crashes. Offline pipeline pre-build in progress (~85%, 0 crashes) |
 | Mission 1 ("Gone Fishing") | ⏳ Pending | — |
 
 ---
