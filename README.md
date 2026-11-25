@@ -38,8 +38,8 @@
 | Build & PE/HLE verification | ✅ Passed | `victory.exe` built cleanly with Rust `1.98.1` (`x86_64-pc-windows-msvc`); all 587 imports resolved |
 | Boot & D3D12 init | ✅ Works | Native Wave64 detected (`min=32 max=64 compute=64`); ~0.5–1.2 ms GPU time |
 | First-boot setup, menus & HUD (`series-s` + FSR) | ✅ Works | **30.0 fps**; setup screens, character loading art & spinner render cleanly in Lab 39 |
-| World loading (from 5400 RPM HDD) | ✅ Reaches world | Reaches `Game Running` / Mission `0x98c85f2a` (`TileHeap 2090/3977 MB`, RAM `5.88 GB` / commit `8.66 GB`); ~12–14 min on HDD |
-| Prologue (in-world) | ⏳ Next | Hit 30 s RAGE watchdog (`+0x23cf683 → +0x2215c35`) on first world frame while compiling pipelines on the fly (`VICTORY_PIPELINE_GATE_S`); zero `amdxc64.dll` crashes. Offline pipeline pre-build in progress (~85%, 0 crashes) |
+| World loading (from 5400 RPM HDD) | ✅ Works | Reaches `Game Running` cleanly after offline pipeline pre-build (`27,144 / 27,144` pipelines, `1,029 s`, 0 `amdxc64.dll` crashes) |
+| Prologue / In-world (`series-s` + FSR) | ✅ In-game | **3.2–3.6 fps** (`278–317 ms/frame`, `4,949 draws/frame`), 0 crashes (clean user exit). World geometry, fences, houses, trees, grass & character silhouette render; night scene shows magenta-tinted vegetation and dark ground/surfaces (8 GB VRAM budget hit `so_far=25500` textures + `VICTORY_PIPELINE_GATE_S=0`) |
 | Mission 1 ("Gone Fishing") | ⏳ Pending | — |
 
 ---
