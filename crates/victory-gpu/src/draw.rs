@@ -1733,6 +1733,12 @@ impl State {
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
         let mut room = crate::resource::room();
+        // On 8 GB GPUs, try reclaiming idle textures immediately before
+        // refusing new ones for 4 seconds.
+        if !room {
+            crate::resource::let_go_idle();
+            room = crate::resource::room();
+        }
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run some

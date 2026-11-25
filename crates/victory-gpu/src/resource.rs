@@ -1466,15 +1466,53 @@ pub(crate) fn room() -> bool {
 /// 238), and the queue was refused from the first world frame on. With
 /// their room kept, the queue stops that much earlier while the world
 /// loads and gets it back as the targets are made.
+/// Default render-target VRAM reserve in MiB when
+/// `VICTORY_CARD_ROOM_FOR_TARGETS_MB` is unset.
+///
+/// The upstream 3,072 MiB figure was measured on 16 GB cards running Series X
+/// targets. On 8 GB cards (DXGI budget ~7.2 GiB) or in Series S 720p mode,
+/// reserving 3 GiB on top of shadow-buffer room leaves almost no headroom for
+/// world textures (`no room for new ones`). Scale the default down to at most
+/// 22% of the card's budget (capped at 1,536 MiB) on <= 9 GiB budgets or in
+/// Series S mode, while keeping 3,072 MiB untouched on >= 12 GiB Series X runs.
+fn default_targets_room_mb(budget_bytes: Option<u64>, series_s: bool) -> u64 {
+    const SERIES_X_LARGE_MB: u64 = 3072;
+    const COMPACT_CAP_MB: u64 = 1536;
+    const COMPACT_BUDGET_LIMIT_MB: u64 = 9 * 1024;
+    let budget_mb = budget_bytes.map(|b| b >> 20).filter(|&mb| mb > 0);
+    if series_s || budget_mb.is_some_and(|mb| mb <= COMPACT_BUDGET_LIMIT_MB) {
+        match budget_mb {
+            Some(mb) => ((mb * 22) / 100).min(COMPACT_CAP_MB),
+            None => COMPACT_CAP_MB,
+        }
+    } else {
+        SERIES_X_LARGE_MB
+    }
+}
+
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
+        if let Some(mb) = std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+        {
+            return mb.min(8192) << 20;
+        }
+        let budget = crate::host::host()
+            .and_then(|h| h.video_memory())
+            .map(|[budget, ..]| budget);
+        let series_s = crate::console::current() == crate::console::Console::SeriesS;
+        let mb = default_targets_room_mb(budget, series_s);
+        tracing::info!(
+            reserve_mb = mb,
+            budget_mb = budget.map(|b| b >> 20),
+            series_s,
+            "VRAM target reserve configured"
+        );
+        mb << 20
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
@@ -4130,5 +4168,26 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn default_targets_room_scales_for_8gb_and_series_s() {
+        let gib = 1024u64 * 1024 * 1024;
+        // 16 GB GPU on Series X keeps the upstream 3,072 MiB reserve.
+        assert_eq!(default_targets_room_mb(Some(15 * gib), false), 3072);
+        // 12 GB GPU on Series X keeps 3,072 MiB.
+        assert_eq!(default_targets_room_mb(Some(11 * gib), false), 3072);
+        // 8 GB GPU (DXGI budget ~7.2 GiB) scales down so textures still fit.
+        let b8 = 7_300u64 << 20;
+        assert_eq!(default_targets_room_mb(Some(b8), false), 1536);
+        assert_eq!(default_targets_room_mb(Some(b8), true), 1536);
+        // 6 GB GPU (~5.4 GiB budget) scales to 22%.
+        let b6 = 5_500u64 << 20;
+        assert_eq!(default_targets_room_mb(Some(b6), true), 1210);
+        // 16 GB GPU in Series S (720p targets) caps at 1,536 MiB.
+        assert_eq!(default_targets_room_mb(Some(15 * gib), true), 1536);
+        // Unknown budget: Series X keeps 3,072, Series S caps at 1,536.
+        assert_eq!(default_targets_room_mb(None, false), 3072);
+        assert_eq!(default_targets_room_mb(None, true), 1536);
     }
 }

@@ -425,7 +425,8 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = dstorage_workers(std::env::var("VICTORY_DSTORAGE_WORKERS").ok().as_deref(), cpus);
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -437,6 +438,16 @@ fn scheduler() -> Option<&'static Scheduler> {
         tracing::info!(workers = started, "dstorage: workers");
     });
     Some(scheduler)
+}
+
+/// Number of DirectStorage worker threads: `VICTORY_DSTORAGE_WORKERS` (clamped
+/// to `1..=64`), or `cpus` when unset or invalid. Lower values (e.g. `2`–`4`)
+/// prevent seek thrashing on rotational HDDs.
+fn dstorage_workers(env: Option<&str>, cpus: usize) -> usize {
+    env.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(cpus)
+        .clamp(1, 64)
 }
 
 impl Scheduler {
@@ -1934,5 +1945,17 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn dstorage_workers_respects_env_and_clamps() {
+        assert_eq!(dstorage_workers(None, 12), 12);
+        assert_eq!(dstorage_workers(Some(""), 12), 12);
+        assert_eq!(dstorage_workers(Some("0"), 12), 12);
+        assert_eq!(dstorage_workers(Some("abc"), 12), 12);
+        assert_eq!(dstorage_workers(Some("2"), 12), 2);
+        assert_eq!(dstorage_workers(Some(" 4 "), 12), 4);
+        assert_eq!(dstorage_workers(Some("999"), 12), 64);
+        assert_eq!(dstorage_workers(None, 0), 1);
     }
 }

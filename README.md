@@ -1,67 +1,73 @@
-<p align="center"><img src="docs/klbf/logo.svg" width="120" alt="KLBF Lab"></p>
-<h1 align="center">KLBF Lab 39 — AMD test branch</h1>
+<h1 align="center">ruff-lab</h1>
+
 <p align="center">
-  <img src="https://img.shields.io/badge/test-Lab%2039-ff7a00" alt="test: Lab 39">
-  <img src="https://img.shields.io/badge/tested%20on-RX%209070%20XT-555" alt="tested on RX 9070 XT">
-  <img src="https://img.shields.io/badge/stage-experimental-ffb000" alt="experimental">
-  <img src="https://img.shields.io/badge/stable-7.3%20fps%20(Series%20S%20%2B%20FSR)-ff7a00" alt="7.3 fps stable, Series S + FSR">
+  <b>An open-source Xbox Series X|S (Scarlett) compatibility runtime fork tuned for mid-range PCs: 8 GB VRAM, 16 GB RAM, and rotational HDDs.</b>
 </p>
 
-<p align="center"><b>Looking for the stable version? → <a href="https://github.com/PastiiJay/klbf-lab">KLBF Lab</a></b> (this branch: test builds)</p>
+<p align="center">
+  <img src="https://img.shields.io/badge/base-KLBF%20Lab%2039-1f46c8" alt="Base: KLBF Lab 39">
+  <img src="https://img.shields.io/badge/GPU-AMD%20RX%206600%20XT%208GB-ed1c24" alt="GPU: AMD RX 6600 XT 8GB">
+  <img src="https://img.shields.io/badge/RAM-16%20GB-1f46c8" alt="RAM: 16 GB">
+  <img src="https://img.shields.io/badge/license-GPL--3.0-555" alt="GPL-3.0">
+</p>
 
-This branch is for **AMD Radeon (RDNA, 64-lane) cards**. It builds on the latest [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (25 Nov 2026, including triippywhale's AMD view-heap clamp and the skin/hair texture re-check; all rendering work there is its author's, see [README.fxceless.md](README.fxceless.md)) and adds fixes found on an RX 9070 XT, plus fixes from other contributors credited below. It is a test build: expect visual defects. The stable branch is [`klbf-lab`](https://github.com/PastiiJay/klbf-lab-beta). Previous test builds are kept as the tags `klbf-lab-33`, `klbf-lab-31`, `klbf-lab-28` and `klbf-lab-26`.
+> [!NOTE]
+> **No game files, dumps, or pre-built binaries are included in this repository.** You must supply your own legally obtained files and build from source.
 
-No game files are included. You need your own legally obtained copy.
+---
 
-## New in Lab 39 (25 Nov 2026)
+## Status (2026-11-25)
 
-| | What changed | Result on our RX 9070 XT |
+**Stage 6 — In-game** on an 8 GB VRAM / 16 GB RAM PC.
+
+Tested on: **Windows 11 x64 (`26200`)** · **AMD Radeon RX 6600 XT 8 GB** (RDNA2, Adrenalin **26.11.2** / `32.0.21045.29003`) · **AMD Ryzen 5 3600** (6C/12T) · **16 GB RAM** · **500 GB 5400 RPM SATA HDD**.
+
+| Lane / Stage | Status | Details |
 |---|---|---|
-| **Water physics** | the ocean height map the GPU writes each frame is copied back into the game's memory, where its physics reads it (ported from Geckomacabre/vx-layer); the XOR swizzle modes it is stored in are now addressed (ported from MiamiGame/XTP, tables from Mesa's addrlib) | in Jason's first mission the boat **floats and moves**: with only the throttle held it sailed over a minute (wake, objectives updating) before hitting the bank; before, it sat on the seabed |
-| **Menus and HUD in Series S mode** | the title's second present plane (interface) is read at the right place (Lab 38) | start screen, menus, map, HUD, subtitles and button prompts show; 41 min of play without a crash |
-| **AMD FSR frame generation** (optional) | `VICTORY_FRAMEGEN=1` presents through AMD's frame generation swap chain (FidelityFX SDK 2.4, `amd_fidelityfx_framegeneration_dx12.dll` in `VICTORY_FFX_FG_DIR` or `VICTORY_FFX_DIR`); off by default; the interface is not interpolated | ~8.5 real fps → ~17 fps shown in the world, no loss of real fps, 12 min without a crash. Generated frames, not real ones: input latency does not improve. Should work on any DX12 card; tested on AMD only |
-| **Pre-build on a fresh cache** | the `pipelines` folder is created first, so a crashed pre-build resumes ([#6](https://github.com/PastiiJay/klbf-lab-beta/issues/6), found by clems206) | |
+| **Boot & D3D12 init** | ✅ Works | Native Wave64 (`min=32 max=64 compute=64`); `0.5–1.2 ms` GPU |
+| **Setup, menus & HUD (`series-s` + FSR)** | ✅ Works | **30.0 fps**; first-boot setup, character loading screens & HUD render cleanly |
+| **Offline pipeline pre-build** | ✅ Works | `27,144 / 27,144` pipelines built in `1,029 s` with **0 `amdxc64.dll` crashes** |
+| **Picture (in-world)** | 🟡 World geometry rendered | Trees, grass, fences, houses, power lines & character silhouette draw (`4,949 draws/frame`); night scene currently shows magenta vegetation and dark surfaces (re-testing with 8 GB VRAM reserve fix) |
+| **Speed (in-world)** | 🟡 **3.2–3.6 fps** | `278–317 ms/frame` at 720p upscaled to 1080p via AMD FidelityFX SDK v2.4.0 (`--console series-s`) |
+| **Stability** | ✅ Clean exit (0 crashes) | Zero `amdxc64.dll` crashes in-world (clean user exit); long-session benchmark pending |
 
-Speed in Lab 39 runs: median 6.6–8.4 fps in the world (720p upscaled to 1080p with AMD FSR), 14 min runs without a crash. If the device is lost about a minute after the world starts loading, try `VICTORY_LATE_WAIT=0`.
+Full session-by-session logs: [logs/results.md](logs/results.md).
 
-## What it fixes on AMD
+---
 
-| Problem on AMD | Cause we found | In this branch |
+## What `ruff-lab` adds on top of KLBF Lab 39
+
+Most compatibility forks are tested on 32 GB RAM and 12–16 GB VRAM cards. `ruff-lab` focuses on making the runtime viable on **8 GB GPUs, 16 GB RAM hosts, and HDD storage**:
+
+| Area | Problem on 8 GB / 16 GB / HDD | Fix in `ruff-lab` |
 |---|---|---|
-| Memory grows ~240 MB/s until Windows runs out | compute shader `39f0e9aeb156a61c` never leaves the AMD driver's compiler | skipped |
-| Purple/magenta blocks stuck on screen | console 32-lane pixel shaders run in 64-lane waves on AMD; NaN piled up in temporal buffers | 32-lane programs run per half wave; NaN/Inf filtered on colour outputs |
-| Missing or late textures | texture upload queue fixed at 192 MB / 250 ms per frame | configurable, larger by default (`VICTORY_TEXTURE_QUEUE_MB`, `VICTORY_TEXTURE_QUEUE_MS`) |
-| Characters missing or broken, faces absent | two meshlet-cull compute shaders hung on AMD and had to be skipped | upstream VIctory #334 (buffer-state tracking) ported; `fc5e66f8f873d3bb` no longer skipped: Lucia's face, hair and outfit render |
-| Compute results not seen by other workgroups | `glc` loads not globally coherent on RDNA | upstream VIctory #1271 ported |
-| Lost or misplaced asset loads | DirectStorage page lists read after the title changed them | read at the title's submit (analysis by JappertjeV, [#3](https://github.com/PastiiJay/klbf-lab-beta/issues/3)); `VICTORY_PAGE_LIST=enqueue|submit|late` to compare |
-| Cell walls, window frame and posters missing (sky where the wall should be) | pipelines skipped while the world loads, textures streamed in part taken for others | ported from [myokex/victory-amd](https://github.com/myokex/victory-amd): pipelines kept across runs and waited for while a world loads (`VICTORY_PIPELINE_GATE_S`), textures shown from their first loaded mip, lost placed views refreshed (`VICTORY_TEXTURE_SWEEP`), dispatches over 65,535 groups split |
-| Walls, window frame and outfit wrong for a whole run, at random | during loading the list of remapped texture ranges overflowed and was thrown away, so which textures got re-checked depended on timing | the list is 32× larger and an overflow triggers a full re-check instead of a drop (found by comparing logs of runs with and without walls) |
-| The AMD shader compiler crashes (`amdxc64.dll`) on a few pipelines | driver bug on two pipelines | `victory translate --cache --pipelines` pre-builds every pipeline offline, saves as it goes, finds the crashing ones and skips them in game too |
+| **8 GB VRAM texture starvation** | `targets_room_kept()` hardcoded a `3,072 MiB` reserve (measured on 16 GB Series X runs), leaving only ~2.5 GB for textures on 8 GB cards (`no room for new ones so_far=25500`) | Adaptive `default_targets_room_mb()` scales the reserve to 22% of DXGI budget (capped at `1,536 MiB`) on ≤ 9 GB GPUs and in Series S 720p mode (+1.5 GB VRAM reclaimed for world textures), and triggers on-demand `resource::let_go_idle()` before refusing new textures (`crates/victory-gpu/src/resource.rs`, `draw.rs`) |
+| **16 GB RAM staging bloat** | Every sampled texture kept a full-size staging copy in system RAM, pushing commit to 12–20 GB and thrashing pagefiles | Integrated [PastiiJay/klbf-lab#23](https://github.com/PastiiJay/klbf-lab/pull/23) (by `spy0eye-beep`): releases staging buffers of unchanged textures after 2 s / 30 frames while keeping metadata |
+| **6-core CPU descriptor lock contention** | Global mutex on `HostHeap::mirror` stalled multi-threaded descriptor updates | Integrated [PastiiJay/klbf-lab#16](https://github.com/PastiiJay/klbf-lab/pull/16) (by `Vladimir-Human`): lock-free Acquire/Release fast path + 256 cache-aligned stripes |
+| **Rotational HDD seek thrashing** | DirectStorage spawned `available_parallelism()` (12) concurrent file reader threads | Added `VICTORY_DSTORAGE_WORKERS` (`1..=64`, default = CPU count) in `crates/victory-hle/src/modules/dstorage.rs` so HDD users can set `2`–`4` workers |
 
-## What you can expect (RX 9070 XT, Adrenalin 32.0.32029.2010, Series X mode)
+---
 
-| | Result |
-|---|---|
-| First cell | walls, window frame, posters and photos drawn; Lucia's face, hair and orange outfit render; inmates in the yard |
-| Speed, Series S mode + AMD FSR (recommended) | **~7.3 fps (median), 74 min with no device removal**, walls drawn throughout |
-| Speed, Series X mode | ~4.8–5.2 fps (≈200 ms/frame); 41 min with no device removal (Lab 33) |
-| Skipped shaders | only one left (`39f0e9aeb156a61c`, which never leaves the AMD compiler); the other 47 we used to skip now run on this card |
-| Cell walls | drawn in 5 of 6 runs (about half before Lab 35). When they are missing, the window frame turns purple and the outfit dark for the whole run; still under investigation |
-| Still wrong | a purple tint on some papers and photos, stretched "web" triangles around some characters that change every frame, some textiles look wet, colour banding in skies |
+## Building & Running
 
-These are a few runs on one machine: other cards and drivers may behave differently.
+Requires Windows 10/11 x64, AVX2 CPU, D3D12 SM 6.6 + Mesh Shaders GPU, Rust (`1.98.1`, pinned in `rust-toolchain.toml`), MSVC C++ Build Tools, and [AMD FidelityFX SDK v2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/releases) for Series S + FSR mode.
 
-## Run
+```powershell
+copy victory.example.toml victory.toml   # set game_dir outside the repo
+cargo test -p victory-gpu --lib -- --test-threads=1
+cargo test -p victory-hle --lib dstorage
+cargo build --release -p victory
+```
 
-Build like VIctory (`cargo build --release`), then pre-build the pipelines once (about 10 minutes, rerun it until it ends without a crash):
+Pre-build pipelines once (recommended on AMD):
 
 ```powershell
 $env:VICTORY_SHADER_OPT = '0'
 $env:VICTORY_SKIP_PIPELINES = (Get-Content docs\klbf\skip-amd.txt -Raw).Trim()
-target\release\victory.exe translate --cache --pipelines --jobs 8 <game dir>\shaders.rpf
+.\target\release\victory.exe translate --cache --pipelines --jobs 8 "<game_dir>\shaders.rpf"
 ```
 
-Then play with:
+Run (`--console series-s` + AMD FSR; add `$env:VICTORY_DSTORAGE_WORKERS = '3'` on HDD):
 
 ```powershell
 $env:VICTORY_SHADER_OPT = '0'
@@ -70,11 +76,18 @@ $env:VICTORY_LATE_WAIT = '1'
 $env:VICTORY_WIDE_BACK = '1'
 $env:VICTORY_PIPELINE_WAIT_MS = '24'
 $env:VICTORY_RELAY_COPY_QUEUE = '0'
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+$env:VICTORY_DSTORAGE_WORKERS = '3'
+$env:VICTORY_FFX_DIR = '<FidelityFX SDK>\Kits\FidelityFX\signedbin'
+.\target\release\victory.exe run --console series-s "<game_dir>\game_scarlett_master.exe" --execute
 ```
 
-`VICTORY_SHADER_OPT=0` turns off the fork's shader clean-up passes, which crashed the AMD compiler for us. `VICTORY_TEXTURE_BUDGET_MB=6144` fixed some dark textiles for another tester but hid the cell walls in both our runs with it, so we leave it off for now. **Faster: Series S mode with AMD FSR.** Add `--console series-s` after `run`, and point `VICTORY_FFX_DIR` at the `signedbin` folder of AMD's official [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) (`$env:VICTORY_FFX_DIR = '<sdk>\Kits\FidelityFX\signedbin'`). The game renders at 1280×720 and FSR upscales it to 1920×1080: ~7.3 fps over 74 min here. Without FSR the Series S picture stays black. In this mode the start screen and the main menu also stay black: press **A** on the controller (or **Enter**, with the game window focused) to get past them; the picture appears once the world loads. Plug the controller in before starting: plugging it in during play pauses the title.
+---
 
-Please report results in an [issue](https://github.com/PastiiJay/klbf-lab-beta/issues): GPU, driver, how long it ran, fps in the window title, and what looks wrong. Patch notes: [CHANGELOG.md](CHANGELOG.md). Full run log: [docs/klbf/results.md](docs/klbf/results.md).
+## Credits & License
 
-Product names are only used to say what this works with; they belong to their owners. KLBF Lab is not affiliated with them. License: GPL-3.0.
+- [Marvisak/VIctory](https://github.com/Marvisak/VIctory) — original Xbox Series X|S compatibility runtime for Windows.
+- [fxceless/victory-fork](https://github.com/fxceless/victory-fork) — renderer and D3D12 work.
+- [PastiiJay/klbf-lab](https://github.com/PastiiJay/klbf-lab) / [klbf-lab-beta](https://github.com/PastiiJay/klbf-lab-beta) — Lab 39 AMD fixes, Series S HUD, water physics, and FSR frame generation.
+- `spy0eye-beep` ([klbf-lab#23](https://github.com/PastiiJay/klbf-lab/pull/23)) & `Vladimir-Human` ([klbf-lab#16](https://github.com/PastiiJay/klbf-lab/pull/16)).
+
+Licensed under **GPL-3.0-or-later**. See [LICENSE](LICENSE).
