@@ -677,8 +677,10 @@ pub(crate) extern "system" fn create_stream(
     }
     // SAFETY: the title passes a whole stream.
     let stream = unsafe { std::slice::from_raw_parts(desc.stream, desc.size) };
-    #[allow(unused_variables)]
-    let (shaders, graphics) = read_stream(stream, copy);
+    #[allow(unused_variables, unused_mut)]
+    let (shaders, mut graphics) = read_stream(stream, copy);
+    #[cfg(windows)]
+    graphics.apply_integer_blend_bypass();
     hand_out(
         shaders,
         #[cfg(windows)]
