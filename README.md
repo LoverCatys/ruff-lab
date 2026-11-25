@@ -18,18 +18,19 @@
 
 ## Status (2026-11-25)
 
-**Stage 6 — In-game** on an 8 GB VRAM / 16 GB RAM PC.
+**Stage 6 — Playable (player-controlled gameplay verified)** on an 8 GB VRAM / 16 GB RAM PC.
 
-Tested on: **Windows 11 x64 (`26200`)** · **AMD Radeon RX 6600 XT 8 GB** (RDNA2, Adrenalin **26.11.2** / `32.0.21045.29003`) · **AMD Ryzen 5 3600** (6C/12T) · **16 GB RAM** · **500 GB 5400 RPM SATA HDD**.
+Tested on: **Windows 11 x64 (`26200`)** · **AMD Radeon RX 6600 XT 8 GB** (RDNA2, Adrenalin **26.11.2** / `32.0.21045.29003`) · **AMD Ryzen 5 3600** (6C/12T) · **16 GB RAM** (pagefile on SATA SSD `F:`) · **500 GB 5400 RPM SATA HDD** (game files on `D:`).
 
 | Lane / Stage | Status | Details |
 |---|---|---|
 | **Boot & D3D12 init** | ✅ Works | Native Wave64 (`min=32 max=64 compute=64`); `0.5–1.2 ms` GPU |
-| **Setup, menus & HUD (`series-s` + FSR)** | ✅ Works | **30.0 fps**; first-boot setup, character loading screens & HUD render cleanly |
+| **Setup, menus & pause UI (`series-s` + FSR)** | ✅ Works | **30.0 fps** in menus/loading, **22 fps** in pause menu (`VI` HUD, map/game/settings tabs, clean blur) |
 | **Offline pipeline pre-build** | ✅ Works | `27,144 / 27,144` pipelines built in `1,029 s` with **0 `amdxc64.dll` crashes** |
-| **Picture (in-world)** | 🟡 Daytime & night scenes rendered | Night car scene (`BF GRETA`, HUD, minimap, compass, Russian subtitles, city lights) & daytime world (blue sky, clouds, palm trees, distant vehicles, Lucia's outfit/hair); streaming LOD lag on 5400 RPM HDD & known Lab 39 face/ground defects |
-| **Speed (in-world)** | 🟡 **3.23 fps avg / 8.70 fps peak** (`6–7 fps` in-world) | 69 pure 3D samples (`draws >= 300`, median `2.80 fps`), 720p upscaled to 1080p via AMD FidelityFX SDK v2.4.0 (`--console series-s`); `30.0 fps` in menus/loading |
-| **Stability** | ✅ **21.8 min** without a crash | Clean user exit, `0` unhandled exceptions, `0` `amdxc64.dll` crashes; adaptive `reserve_mb=1536` on `budget_mb=7379` active |
+| **Player control (Stage 6)** | ✅ Verified | **Native DualShock 4 (`0x09CC`) HID input** — walked & rotated camera (`L`/`R`) through the prison yard and cell, interacted with cellmate (`LT`), followed the guard through the corridor & dayroom, progressed through the counselor's office to the bank robbery sequence (with audio) |
+| **Picture (in-world)** | 🟢 Natural lighting (no magenta) | `ambient.rs` (`level=0.6`, `reflections held=0.5`) eliminates AMD magenta RTGI & whitewashed reflections: sunlit exterior with Lucia & parking lot, 20+ prison yard inmates, prison cell interior, volumetric hallway lighting, dayroom with live TV screen, counselor's office, and bank robbery with hostages & cash; some HDD LOD streaming lag & occasional dark face lighting in shadow |
+| **Speed (in-world)** | 🟡 **3.62 fps avg / 3.70 median / 7.30 peak** | **250 pure 3D samples** (`draws >= 300`, avg `3,037` / peak `8,357 draws/frame`), 720p upscaled to 1080p via AMD FidelityFX SDK v2.4.0 (`--console series-s`); `30.0 fps` in menus |
+| **Stability** | ✅ **39.1 min** without a crash | Clean user exit, `0` unhandled exceptions, `0` device removals, `0` `amdxc64.dll` crashes; adaptive `reserve_mb=1024` on `budget_mb=7379` active |
 
 Full session-by-session logs: [logs/results.md](logs/results.md).
 

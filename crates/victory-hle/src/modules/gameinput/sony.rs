@@ -241,10 +241,105 @@ fn open() -> Option<(windows_sys::Win32::Foundation::HANDLE, Kind)> {
     }
 }
 
+/// Builds a DualShock 4 USB HID output report (32 bytes) setting the lightbar RGB.
+fn ds4_usb_lightbar(r: u8, g: u8, b: u8) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[0] = 0x05; // USB output report ID
+    out[1] = 0x07; // enable rumble | lightbar | flash
+    out[6] = r;
+    out[7] = g;
+    out[8] = b;
+    out
+}
+
+/// IEEE 802.3 CRC-32 used by DualShock 4 Bluetooth HID output reports.
+fn crc32_ieee(prefix: u8, data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in std::iter::once(prefix).chain(data.iter().copied()) {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Builds a DualShock 4 Bluetooth HID output report (78 bytes) setting the lightbar RGB.
+fn ds4_bt_lightbar(r: u8, g: u8, b: u8) -> [u8; 78] {
+    let mut out = [0u8; 78];
+    out[0] = 0x11; // Bluetooth output report ID
+    out[1] = 0xC0; // HID + poll rate
+    out[2] = 0x20;
+    out[3] = 0x07; // enable rumble | lightbar | flash
+    out[8] = r;
+    out[9] = g;
+    out[10] = b;
+    let crc = crc32_ieee(0xA2, &out[..74]);
+    out[74..78].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
+/// Builds a DualSense USB HID output report (48 bytes) setting the lightbar RGB.
+fn dualsense_usb_lightbar(r: u8, g: u8, b: u8) -> [u8; 48] {
+    let mut out = [0u8; 48];
+    out[0] = 0x02; // USB output report ID
+    out[2] = 0x04; // lightbar color valid
+    out[45] = r;
+    out[46] = g;
+    out[47] = b;
+    out
+}
+
+/// Lights up the controller's lightbar so the user can see it is bound and active.
+fn set_lightbar(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    kind: Kind,
+    usb: bool,
+    r: u8,
+    g: u8,
+    b: u8,
+) {
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    let report_usb_ds4;
+    let report_bt_ds4;
+    let report_usb_ds5;
+    let bytes: &[u8] = match (kind, usb) {
+        (Kind::DualShock4, true) => {
+            report_usb_ds4 = ds4_usb_lightbar(r, g, b);
+            &report_usb_ds4
+        }
+        (Kind::DualShock4, false) => {
+            report_bt_ds4 = ds4_bt_lightbar(r, g, b);
+            &report_bt_ds4
+        }
+        (Kind::DualSense, true) => {
+            report_usb_ds5 = dualsense_usb_lightbar(r, g, b);
+            &report_usb_ds5
+        }
+        (Kind::DualSense, false) => return,
+    };
+    let mut written = 0u32;
+    // SAFETY: valid handle opened with GENERIC_WRITE and valid report slice.
+    let ok = unsafe {
+        WriteFile(
+            handle,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            &mut written,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != 0 {
+        tracing::info!(?kind, usb, r, g, b, "Sony HID gamepad lightbar set");
+    }
+}
+
 /// Reads HID input reports until the controller disconnects.
 fn read(handle: windows_sys::Win32::Foundation::HANDLE, kind: Kind) {
     use windows_sys::Win32::Storage::FileSystem::ReadFile;
     let mut buffer = [0u8; 128];
+    let mut lit = false;
     loop {
         let mut n = 0u32;
         // SAFETY: valid handle and writable buffer of `buffer.len()` bytes.
@@ -260,7 +355,12 @@ fn read(handle: windows_sys::Win32::Foundation::HANDLE, kind: Kind) {
         if ok == 0 || n == 0 {
             return;
         }
-        if let Some(report) = parse(&buffer[..n as usize], n <= 64, kind) {
+        let usb = n <= 64;
+        if let Some(report) = parse(&buffer[..n as usize], usb, kind) {
+            if !lit {
+                lit = true;
+                set_lightbar(handle, kind, usb, 0, 220, 90);
+            }
             *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some((report, Instant::now()));
         }
     }
@@ -319,5 +419,15 @@ mod tests {
         assert_eq!(r.buttons, Y);
         assert_eq!((r.left_x, r.left_y), (-1.0, -1.0));
         assert_eq!(parse(&[0x02, 0, 0], true, Kind::DualSense), None);
+    }
+
+    #[test]
+    fn ds4_lightbar_reports_have_expected_headers_and_crc() {
+        let usb = ds4_usb_lightbar(0, 220, 90);
+        assert_eq!((usb[0], usb[1], usb[6], usb[7], usb[8]), (0x05, 0x07, 0, 220, 90));
+        let bt = ds4_bt_lightbar(0, 220, 90);
+        assert_eq!((bt[0], bt[1], bt[3], bt[8], bt[9], bt[10]), (0x11, 0xC0, 0x07, 0, 220, 90));
+        let crc = u32::from_le_bytes(bt[74..78].try_into().unwrap());
+        assert_eq!(crc, crc32_ieee(0xA2, &bt[..74]));
     }
 }
