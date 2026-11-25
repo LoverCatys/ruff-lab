@@ -27,9 +27,9 @@ Tested on: **Windows 11 x64 (`26200`)** · **AMD Radeon RX 6600 XT 8 GB** (RDNA2
 | **Boot & D3D12 init** | ✅ Works | Native Wave64 (`min=32 max=64 compute=64`); `0.5–1.2 ms` GPU |
 | **Setup, menus & HUD (`series-s` + FSR)** | ✅ Works | **30.0 fps**; first-boot setup, character loading screens & HUD render cleanly |
 | **Offline pipeline pre-build** | ✅ Works | `27,144 / 27,144` pipelines built in `1,029 s` with **0 `amdxc64.dll` crashes** |
-| **Picture (in-world)** | 🟡 World geometry rendered | Trees, grass, fences, houses, power lines & character silhouette draw (`4,949 draws/frame`); night scene currently shows magenta vegetation and dark surfaces (re-testing with 8 GB VRAM reserve fix) |
-| **Speed (in-world)** | 🟡 **3.2–3.6 fps** | `278–317 ms/frame` at 720p upscaled to 1080p via AMD FidelityFX SDK v2.4.0 (`--console series-s`) |
-| **Stability** | ✅ Clean exit (0 crashes) | Zero `amdxc64.dll` crashes in-world (clean user exit); long-session benchmark pending |
+| **Picture (in-world)** | 🟡 Daytime & night scenes rendered | Night car scene (`BF GRETA`, HUD, minimap, compass, Russian subtitles, city lights) & daytime world (blue sky, clouds, palm trees, distant vehicles, Lucia's outfit/hair); streaming LOD lag on 5400 RPM HDD & known Lab 39 face/ground defects |
+| **Speed (in-world)** | 🟡 **3.23 fps avg / 8.70 fps peak** (`6–7 fps` in-world) | 69 pure 3D samples (`draws >= 300`, median `2.80 fps`), 720p upscaled to 1080p via AMD FidelityFX SDK v2.4.0 (`--console series-s`); `30.0 fps` in menus/loading |
+| **Stability** | ✅ **21.8 min** without a crash | Clean user exit, `0` unhandled exceptions, `0` `amdxc64.dll` crashes; adaptive `reserve_mb=1536` on `budget_mb=7379` active |
 
 Full session-by-session logs: [logs/results.md](logs/results.md).
 
