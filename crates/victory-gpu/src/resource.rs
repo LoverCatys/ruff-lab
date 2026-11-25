@@ -1477,10 +1477,16 @@ pub(crate) fn room() -> bool {
 /// Series S mode, while keeping 3,072 MiB untouched on >= 12 GiB Series X runs.
 fn default_targets_room_mb(budget_bytes: Option<u64>, series_s: bool) -> u64 {
     const SERIES_X_LARGE_MB: u64 = 3072;
+    const SERIES_S_CAP_MB: u64 = 1024;
     const COMPACT_CAP_MB: u64 = 1536;
     const COMPACT_BUDGET_LIMIT_MB: u64 = 9 * 1024;
     let budget_mb = budget_bytes.map(|b| b >> 20).filter(|&mb| mb > 0);
-    if series_s || budget_mb.is_some_and(|mb| mb <= COMPACT_BUDGET_LIMIT_MB) {
+    if series_s {
+        match budget_mb {
+            Some(mb) => ((mb * 14) / 100).min(SERIES_S_CAP_MB),
+            None => SERIES_S_CAP_MB,
+        }
+    } else if budget_mb.is_some_and(|mb| mb <= COMPACT_BUDGET_LIMIT_MB) {
         match budget_mb {
             Some(mb) => ((mb * 22) / 100).min(COMPACT_CAP_MB),
             None => COMPACT_CAP_MB,
@@ -4180,14 +4186,14 @@ float4 lit() : SV_Target { return 1.0; }
         // 8 GB GPU (DXGI budget ~7.2 GiB) scales down so textures still fit.
         let b8 = 7_300u64 << 20;
         assert_eq!(default_targets_room_mb(Some(b8), false), 1536);
-        assert_eq!(default_targets_room_mb(Some(b8), true), 1536);
-        // 6 GB GPU (~5.4 GiB budget) scales to 22%.
+        assert_eq!(default_targets_room_mb(Some(b8), true), 1022);
+        // 6 GB GPU (~5.4 GiB budget) scales to 14% in Series S mode.
         let b6 = 5_500u64 << 20;
-        assert_eq!(default_targets_room_mb(Some(b6), true), 1210);
-        // 16 GB GPU in Series S (720p targets) caps at 1,536 MiB.
-        assert_eq!(default_targets_room_mb(Some(15 * gib), true), 1536);
-        // Unknown budget: Series X keeps 3,072, Series S caps at 1,536.
+        assert_eq!(default_targets_room_mb(Some(b6), true), 770);
+        // 16 GB GPU in Series S (720p targets) caps at 1,024 MiB.
+        assert_eq!(default_targets_room_mb(Some(15 * gib), true), 1024);
+        // Unknown budget: Series X keeps 3,072, Series S caps at 1,024.
         assert_eq!(default_targets_room_mb(None, false), 3072);
-        assert_eq!(default_targets_room_mb(None, true), 1536);
+        assert_eq!(default_targets_room_mb(None, true), 1024);
     }
 }
