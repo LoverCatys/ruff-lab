@@ -1067,6 +1067,10 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
+/// Native Sony DualShock 4 & DualSense HID pad fallback when no XInput pad is connected.
+#[cfg(windows)]
+mod sony;
+
 /// Host input: XInput pads, the keyboard while our process has focus.
 #[cfg(windows)]
 mod host {
@@ -1132,16 +1136,32 @@ mod host {
         empty_until: [Option<Instant>; PADS],
     }
 
+    fn sony_pad(slot: usize) -> Option<PadState> {
+        if slot != 0 {
+            return None;
+        }
+        let r = super::sony::latest()?;
+        Some(PadState {
+            buttons: r.buttons,
+            left_trigger: r.left_trigger,
+            right_trigger: r.right_trigger,
+            left_x: r.left_x,
+            left_y: r.left_y,
+            right_x: r.right_x,
+            right_y: r.right_y,
+        })
+    }
+
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
+                return sony_pad(slot);
             }
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
+                return sony_pad(slot);
             }
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
