@@ -474,7 +474,7 @@ struct Guards {
     /// Blocks we made read-only.
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
-    clean: BTreeSet<usize>,
+    clean: CleanBlocks,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
@@ -482,13 +482,118 @@ struct Guards {
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
     aliased: BTreeSet<usize>,
+    /// Kernel answers of [`uncommitted_end`] for absent blocks, kept for a frame.
+    uncommitted: Uncommitted,
+}
+
+/// [`uncommitted_end`]'s answers, run start -> end (blocks), for the frame
+/// [`crate::queue::presented`] numbered when they were asked.
+/// Adapted from edsuuu/VI-BR-PORT (`136efde0ab`, GPL-3.0-or-later).
+struct Uncommitted {
+    frame: u64,
+    runs: BTreeMap<usize, usize>,
+}
+
+impl Uncommitted {
+    /// The runs over `[at, end)` (bytes) are asked about again.
+    fn forget(&mut self, at: usize, end: usize) {
+        let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+        self.runs.retain(|&from, &mut to| to <= first || from >= last);
+    }
+
+    fn end(&mut self, block: usize) -> usize {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_UNCOMMITTED_MEMO").is_none_or(|v| v != "0")) {
+            return uncommitted_end(block);
+        }
+        // Once a frame the kernel is asked again whatever we were told.
+        let frame = crate::queue::presented();
+        if frame != self.frame {
+            self.frame = frame;
+            self.runs.clear();
+        }
+        if let Some((_, &end)) = self.runs.range(..=block).next_back()
+            && end > block
+        {
+            return end;
+        }
+        let end = uncommitted_end(block);
+        if end > block {
+            self.runs.insert(block, end);
+        }
+        end
+    }
+}
+
+/// Disjoint, non-touching half-open runs of clean blocks.
+/// Adapted from edsuuu/VI-BR-PORT (`ac6e475108`, based on victory-fork#824).
+struct CleanBlocks(BTreeMap<usize, usize>);
+
+impl CleanBlocks {
+    fn insert(&mut self, mut from: usize, mut to: usize) {
+        if from >= to {
+            return;
+        }
+        if let Some((&start, &end)) = self.0.range(..=from).next_back()
+            && end >= from
+        {
+            if end >= to {
+                return;
+            }
+            from = start;
+        }
+        while let Some((&start, &end)) = self.0.range(from..=to).next() {
+            self.0.remove(&start);
+            to = to.max(end);
+        }
+        self.0.insert(from, to);
+    }
+
+    fn remove(&mut self, block: usize) {
+        let Some((&from, &to)) = self.0.range(..=block).next_back() else {
+            return;
+        };
+        if block >= to {
+            return;
+        }
+        if from < block {
+            self.0.insert(from, block);
+        } else {
+            self.0.remove(&from);
+        }
+        if block + 1 < to {
+            self.0.insert(block + 1, to);
+        }
+    }
+
+    fn uncovered(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let mut next = self.0.range(..=from).next_back().map_or(from, |(_, &end)| from.max(end));
+        let mut missing = Vec::new();
+        if next >= to {
+            return missing;
+        }
+        for (&start, &end) in self.0.range(from + 1..to) {
+            if next < start {
+                missing.push((next, start));
+            }
+            next = end;
+        }
+        if next < to {
+            missing.push((next, to));
+        }
+        missing
+    }
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
-    clean: BTreeSet::new(),
+    clean: CleanBlocks(BTreeMap::new()),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
+    uncommitted: Uncommitted {
+        frame: 0,
+        runs: BTreeMap::new(),
+    },
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -518,49 +623,40 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     install();
     let mut g = guards();
     let mut written = Vec::new();
-    let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    // The range's clean blocks, in order: read off the set in one pass,
-    // not looked up one block at a time. A frame asks about some 10 GB of
-    // view memory, 150,000 blocks, nearly all clean: the lookups were most
-    // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
-    // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
-    if clean.len() == last - first {
-        // Nothing written, mapped or new since the range was last taken.
-        return Some(written);
-    }
-    let mut next_clean = 0;
+    // Large heaps are usually clean. Walk only gaps between clean runs.
     let mut uncommitted_until = first;
-    for block in first..=last {
-        while next_clean < clean.len() && clean[next_clean] < block {
-            next_clean += 1;
-        }
-        let is_clean = next_clean < clean.len() && clean[next_clean] == block;
-        let mut open = block < last && !is_clean;
-        if open && g.absent.contains(&block) {
-            // Ordinary commits need no runtime mapping notification. Reuse
-            // this asking's query for the following blocks in the same region.
-            if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
+    for (from, to) in g.clean.uncovered(first, last) {
+        let mut run = None;
+        for block in from..to {
+            let mut open = true;
+            if g.absent.contains(&block) {
+                // Ordinary commits need no runtime mapping notification. Reuse
+                // this asking's query for the following blocks in the same region.
+                if block >= uncommitted_until {
+                    uncommitted_until = g.uncommitted.end(block);
+                }
+                open = block >= uncommitted_until;
+                if open {
+                    g.absent.remove(&block);
+                }
             }
-            open = block >= uncommitted_until;
             if open {
-                g.absent.remove(&block);
+                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                if g.protected.contains(&block) {
+                    // Written through the runtime, still read-only.
+                    g.clean.insert(block, block + 1);
+                } else {
+                    run.get_or_insert(block);
+                    continue;
+                }
+            }
+            if let Some(begin) = run.take() {
+                protect(&mut g, begin, block);
             }
         }
-        if open {
-            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.protected.contains(&block) {
-                // Written through the runtime, still read-only.
-                g.clean.insert(block);
-            } else {
-                run.get_or_insert(block);
-                continue;
-            }
-        }
-        if let Some(from) = run.take() {
-            protect(&mut g, from, block);
+        if let Some(begin) = run {
+            protect(&mut g, begin, to);
         }
     }
     Some(written)
@@ -698,7 +794,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
-        g.clean.extend(from..to);
+        g.clean.insert(from, to);
     };
     if set(from, to) {
         note(g, from, to);
@@ -763,7 +859,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .collect();
     for &block in &blocks {
         g.protected.remove(&block);
-        g.clean.remove(&block);
+        g.clean.remove(block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
@@ -777,7 +873,10 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    let mut g = guards();
+    g.uncommitted.forget(at, at.saturating_add(len));
+    open(&mut g, at, at.saturating_add(len));
+    drop(g);
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -846,6 +945,8 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     }
     {
         let mut g = guards();
+        // Written through a view of our own: the pages may be committed now.
+        g.uncommitted.forget(at, end);
         let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
         if pages {
             WRITTEN[2].fetch_add(guarded, Relaxed);
@@ -1092,6 +1193,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
+    // A mapping commits what was a placeholder: the runs over it are asked again.
+    g.uncommitted.forget(at, at.saturating_add(len));
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
@@ -1100,7 +1203,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
-        g.clean.remove(&block);
+        g.clean.remove(block);
     }
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
@@ -1168,6 +1271,54 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn uncommitted_runs_are_kept_until_their_memory_is_remapped() {
+        // SAFETY: a fresh reservation of four blocks, released at the end.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 4 * BLOCK, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        let first = base / BLOCK;
+        let mut memo = Uncommitted { frame: crate::queue::presented(), runs: BTreeMap::new() };
+        assert_eq!(memo.end(first + 1), first + 4);
+        // SAFETY: inside the reservation.
+        assert!(!unsafe { VirtualAlloc((base + BLOCK) as *const _, BLOCK, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        // Kept: no mapping was told of.
+        assert_eq!(memo.end(first + 1), first + 4);
+        // As title_memory_remapped drops the runs over the block.
+        memo.forget(base + BLOCK, base + 2 * BLOCK);
+        assert_eq!(memo.end(first + 1), first + 1, "a committed block is not uncommitted");
+        // SAFETY: the reservation made above.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn clean_runs_match_per_block_tracking() {
+        let mut runs = CleanBlocks(BTreeMap::new());
+        let mut blocks = BTreeSet::new();
+        let check = |runs: &CleanBlocks, blocks: &BTreeSet<usize>| {
+            for from in 0..36 {
+                for to in from..36 {
+                    let actual: Vec<_> = runs.uncovered(from, to).into_iter().flat_map(|(a, b)| a..b).collect();
+                    let expected: Vec<_> = (from..to).filter(|block| !blocks.contains(block)).collect();
+                    assert_eq!(actual, expected, "{from}..{to}");
+                }
+            }
+        };
+
+        for (from, to) in [(5, 12), (1, 3), (3, 7), (23, 33), (17, 20), (9, 26), (2, 3)] {
+            runs.insert(from, to);
+            blocks.extend(from..to);
+            check(&runs, &blocks);
+        }
+        for block in [0, 1, 11, 14, 15, 32, 13, 12] {
+            runs.remove(block);
+            blocks.remove(&block);
+            check(&runs, &blocks);
+        }
+        runs.insert(11, 16);
+        blocks.extend(11..16);
+        check(&runs, &blocks);
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
@@ -1311,6 +1462,8 @@ mod tests {
         assert!(!refresh().contains(&(late / PAGE)));
 
         commit(late, KERNEL_PAGE); // Ordinary commit, without a runtime mapping notification.
+        // Seen from the next frame on (the kernel's answers are kept for one).
+        guards().uncommitted.frame = u64::MAX;
         for at in [early, late] {
             assert!(writable(at));
             // SAFETY: each address is inside its committed read-write page.

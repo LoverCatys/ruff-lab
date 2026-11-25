@@ -18,7 +18,7 @@
 
 ## Status (2026-11-25)
 
-**Stage 6 — Playable (player-controlled gameplay verified)** on an 8 GB VRAM / 16 GB RAM PC.
+**Stage 6 — In-game (player-controlled gameplay verified)** on an 8 GB VRAM / 16 GB RAM PC.
 
 Tested on: **Windows 11 x64 (`26200`)** · **AMD Radeon RX 6600 XT 8 GB** (RDNA2, Adrenalin **26.11.2** / `32.0.21045.29003`) · **AMD Ryzen 5 3600** (6C/12T) · **16 GB RAM** (pagefile on SATA SSD `F:`) · **500 GB 5400 RPM SATA HDD** (game files on `D:`).
 
@@ -50,7 +50,9 @@ Most compatibility forks are tested on 32 GB RAM and 12–16 GB VRAM cards. `ruf
 | **Native Sony DS4 / DualSense input** | DualShock 4 & DualSense controllers required `x360ce` / `ViGEmBus` / `DS4Windows`, which often broke or failed to bind to `GameInput` | Native Windows HID reader (`crates/victory-hle/src/modules/gameinput/sony.rs`, adapted from [realblastex/flamingo](https://github.com/realblastex/flamingo)) supporting **DualShock 4** (v1/v2/dongle) & **DualSense / Edge** over USB and Bluetooth as slot 0 fallback (`VICTORY_SONY_PAD=0` to disable) |
 | **BCPack fragment edge cases** | Corner-case single-fragment / zero-count BCPack textures could fail decompression | Backported [Marvisak/VIctory#2648](https://github.com/Marvisak/VIctory/pull/2648) & [#2649](https://github.com/Marvisak/VIctory/pull/2649) in `crates/victory-formats/src/bcpack.rs` |
 | **Release binary CPU throughput** | Default release profile compiled without LTO across crates | Enabled `lto = "thin"` and `codegen-units = 1` in `Cargo.toml` (from [Belobug/VIctory-Belobug-AMD#96](https://github.com/Belobug/VIctory-Belobug-AMD/pull/96)) |
-| **Refused AMD shaders & pipelines** | 40+ shaders failed translation on uniform static-sampler branches or split wave64 lane masks; D3D12 rejected pipelines with blending enabled on integer render targets | Ported static-sampler branch selection, integer-target blend bypass (`ddb73326b0`), and split wave64 lane-mask recovery (`76749ce58d`) from [DexNom/VIctory](https://github.com/DexNom/VIctory) |
+| **Refused AMD shaders & pipelines** | 40+ shaders failed translation on uniform static-sampler branches or split wave64 lane masks; D3D12 rejected pipelines with blending enabled on integer render targets | Ported static-sampler branch selection, integer-target blend bypass (`ddb73326b0`), and split wave64 lane-mask recovery (`76749ce58d`) from [DexNom/VIctory](https://github.com/DexNom/VIctory), plus 3D `DispatchMesh(x, y, z)` forwarding (`VIctory#2624`) |
+| **16 GB RAM commit pressure & pipeline worker bloat** | Background pipeline workers spawned 6+ threads (~3–5 GB extra RAM) and GPU textures could exhaust Windows commit (`error 1455`) | Added `VICTORY_PIPELINE_WORKERS` ([Marvisak/VIctory#2752](https://github.com/Marvisak/VIctory/pull/2752)) and `VICTORY_COMMIT_RESERVE_MB` (adapted from [ka1qux/BRVIctory-ka1qux](https://github.com/ka1qux/BRVIctory-ka1qux) `8cac16489a`) to protect free system commit |
+| **CPU frame time: view guards, remaps & BC7 decode** | Per-block `BTreeSet` clean-block scans, repeated `VirtualQuery` calls on unmapped blocks, redundant page remap splits/commits, and slower BC7 BCPack decoding | Ported interval `CleanBlocks` + per-frame `Uncommitted` query cache (`VICTORY_UNCOMMITTED_MEMO`, from [edsuuu/VI-BR-PORT](https://github.com/edsuuu/VI-BR-PORT) `ac6e475108` & `136efde0ab`), lean page remaps (`VICTORY_REMAP_LEAN=1`, from `ka1qux` `b1d7012a44` / `victory-fork#1069`), and +27% BC7 BCPack lookup tables ([Marvisak/VIctory#2735](https://github.com/Marvisak/VIctory/pull/2735)) |
 
 ---
 
@@ -97,6 +99,8 @@ $env:VICTORY_FFX_DIR = '<FidelityFX SDK>\Kits\FidelityFX\signedbin'
 - [realblastex/flamingo](https://github.com/realblastex/flamingo) — native DualSense HID reader design adapted for DS4 + DualSense in `gameinput/sony.rs`.
 - [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD) — ambient light & reflection clamp pass (`ambient.rs`) fixing AMD magenta RTGI, and release LTO optimization (`#96`).
 - [DexNom/VIctory](https://github.com/DexNom/VIctory) — uniform static-sampler branch lowering, integer-target blend bypass (`ddb73326b0`), and split wave64 lane-mask recovery (`76749ce58d`).
-- `spy0eye-beep` ([klbf-lab#23](https://github.com/PastiiJay/klbf-lab/pull/23)) & `Vladimir-Human` ([klbf-lab#16](https://github.com/PastiiJay/klbf-lab/pull/16)).
+- [ka1qux/BRVIctory-ka1qux](https://github.com/ka1qux/BRVIctory-ka1qux) — Windows commit reserve (`VICTORY_COMMIT_RESERVE_MB`), lean page remaps (`VICTORY_REMAP_LEAN=1`, after `victory-fork#1069`), and 3D `DispatchMesh` forwarding (`VIctory#2624`).
+- [edsuuu/VI-BR-PORT](https://github.com/edsuuu/VI-BR-PORT) — interval `CleanBlocks` (`ac6e475108`, based on `victory-fork#824`) and per-frame `Uncommitted` view-block memo (`136efde0ab`).
+- Upstream PR contributors: `0xKaji` ([VIctory#2752](https://github.com/Marvisak/VIctory/pull/2752)), [VIctory#2735](https://github.com/Marvisak/VIctory/pull/2735), `spy0eye-beep` ([klbf-lab#23](https://github.com/PastiiJay/klbf-lab/pull/23)), & `Vladimir-Human` ([klbf-lab#16](https://github.com/PastiiJay/klbf-lab/pull/16)).
 
 Licensed under **GPL-3.0-or-later**. See [LICENSE](LICENSE).

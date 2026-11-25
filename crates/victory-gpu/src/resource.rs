@@ -1431,6 +1431,9 @@ pub(crate) fn room() -> bool {
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+    if filled >= FLOOR && commit_short(100) {
+        return false;
+    }
     if let Some(limit) = limit {
         return filled < limit;
     }
@@ -1447,6 +1450,62 @@ pub(crate) fn room() -> bool {
         }
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// The PC's commit the texture queue leaves free, in bytes:
+/// `VICTORY_COMMIT_RESERVE_MB` (0, the default: none; at most 32,768).
+/// Every byte of VRAM textures also costs a byte of Windows system commit;
+/// keeping a reserve prevents error 1455 OOM on 16 GB RAM PCs.
+/// Adapted from ka1qux/BRVIctory-ka1qux (`8cac16489a`, GPL-3.0-or-later).
+#[cfg(windows)]
+fn commit_reserve() -> u64 {
+    static RESERVE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RESERVE.get_or_init(|| {
+        let reserve = std::env::var("VICTORY_COMMIT_RESERVE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(0, |mb| mb.min(32_768) << 20);
+        if reserve > 0 {
+            tracing::info!(
+                reserve_mb = reserve >> 20,
+                "VICTORY_COMMIT_RESERVE_MB: pausing new index textures while free Windows commit is below reserve"
+            );
+        }
+        reserve
+    })
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn short_of_commit(left: u64, reserve: u64, percent: u64) -> bool {
+    reserve > 0 && left < reserve / 100 * percent
+}
+
+#[cfg(windows)]
+fn commit_short(percent: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let reserve = commit_reserve();
+    if reserve == 0 {
+        return false;
+    }
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tenth = crate::host::now_ms() / 100 + 1;
+    let left = if LAST.load(Relaxed) == tenth {
+        LEFT.load(Relaxed)
+    } else {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: plain data filled in by the query.
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: a sized structure; on failure nothing is said short.
+        if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+            return false;
+        }
+        LEFT.store(m.ullAvailPageFile, Relaxed);
+        LAST.store(tenth, Relaxed);
+        m.ullAvailPageFile
+    };
+    short_of_commit(left, reserve, percent)
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -1809,7 +1868,10 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let mut idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    if commit_short(100) {
+        idle_ms = idle_ms.min(1_000);
+    }
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -4195,5 +4257,18 @@ float4 lit() : SV_Target { return 1.0; }
         // Unknown budget: Series X keeps 3,072, Series S caps at 1,024.
         assert_eq!(default_targets_room_mb(None, false), 3072);
         assert_eq!(default_targets_room_mb(None, true), 1024);
+    }
+
+    #[test]
+    fn commit_reserve_lines() {
+        let gb = 1u64 << 30;
+        assert!(!short_of_commit(0, 0, 100));
+        assert!(!short_of_commit(gb, 0, 25));
+        assert!(short_of_commit(5 * gb, 6 * gb, 100));
+        assert!(!short_of_commit(6 * gb, 6 * gb, 100));
+        assert!(!short_of_commit(5 * gb, 6 * gb, 50));
+        assert!(short_of_commit(2 * gb, 6 * gb, 50));
+        assert!(!short_of_commit(2 * gb, 6 * gb, 25));
+        assert!(short_of_commit(gb, 6 * gb, 25));
     }
 }
