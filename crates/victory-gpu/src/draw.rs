@@ -1585,23 +1585,45 @@ impl State {
         let started = std::time::Instant::now();
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots written since the
-        // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
+        // last pass are looked at again, plus a small rotating 1/N slice of
+        // all buffer slots (`VICTORY_HEAP_RESCAN_FRAMES`, default 64) so
+        // stale/released views are refreshed smoothly without 150-400 ms
+        // full-heap rescan spikes every 16 frames.
+        static RESCAN_FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let rescan = *RESCAN_FRAMES.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_RESCAN_FRAMES")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map_or(64, |v| v.clamp(1, 256))
+        });
         let mut kept = HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner());
         let (passes, ranges) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, HeapRanges::new()));
-        let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
-        } else {
-            changed
-        };
+        let mut slots = host.buffer_changes();
+        let pass = *passes;
         *passes += 1;
+        if pass == 0 {
+            ranges.clear();
+            slots = host.buffer_slots();
+        } else {
+            let all = host.buffer_slots();
+            let slice_idx = (pass % rescan) as usize;
+            let total = all.len();
+            if total > 0 {
+                let stride = rescan as usize;
+                let from = total * slice_idx / stride;
+                let to = total * (slice_idx + 1) / stride;
+                if from < to {
+                    slots.extend_from_slice(&all[from..to]);
+                }
+            }
+            if slice_idx == 0 && !ranges.is_empty() {
+                let live: std::collections::HashSet<u32> = all.iter().copied().collect();
+                ranges.retain(|k, _| live.contains(k));
+            }
+        }
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1817,7 +1839,16 @@ impl State {
         let frame = crate::frame::current();
         host.texture_slots_remapped(frame);
         let due_now = host.texture_slots_due(frame, 1).1[1];
-        let burst = !first_world && due_now >= 256;
+        // Mid-run scene bursts only trigger when VRAM actually has room and
+        // after a 10 s cooldown, so a full-VRAM queue never fires `scene_burst`
+        // (and clock-freeze stalls) every few frames in vain.
+        static LAST_GATE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        let burst = if !first_world && due_now >= 512 && crate::resource::room() {
+            let last = LAST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+            last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10))
+        } else {
+            false
+        };
         if !first_world && !burst {
             self.heap_textures(list, heap, host);
             return;
@@ -1831,6 +1862,7 @@ impl State {
             self.heap_textures(list, heap, host);
             return;
         }
+        *LAST_GATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
         let _freeze = crate::preload::freeze_clock();
         let started = std::time::Instant::now();
         let uploaded_start = HEAP_TEXTURES.load(Ordering::Relaxed);
@@ -1854,6 +1886,9 @@ impl State {
         let mut stale_since: Option<std::time::Instant> = None;
         while started.elapsed() < timeout {
             if crate::descriptor::host::device_removed().is_some() {
+                break;
+            }
+            if !first_world && !crate::resource::room() {
                 break;
             }
             let left_ms = timeout
