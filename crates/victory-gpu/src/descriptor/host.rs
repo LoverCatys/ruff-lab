@@ -2455,9 +2455,9 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     // of the copy they find, so that the copy brought up to date is the
     // one the slot shows.
     if let Some((base, width)) = buffer_extent(view)
-        && let Some((first, count, element, stride, unknown)) = buffer_fields(view)
+        && let Some((first, count, element, stride, unknown, raw)) = buffer_fields(view)
         && let Some(whole) = crate::shadow::find(base, width)
-        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
+        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown, raw)
         && let Some(own) = crate::shadow::exact(start, bytes)
     {
         return Some((own, start, bytes));
@@ -2544,8 +2544,18 @@ fn own_copy_on() -> bool {
 /// a view has no host view there; it is made on a copy of its own bytes
 /// (`crate::shadow::exact`), where it starts at element 0. `None`: the
 /// view is made on its buffer's copy, as every other.
-fn own_bytes(offset: u64, base: u64, first: u64, count: u32, element: u64, stride: u32, unknown: bool) -> Option<(u64, u64)> {
-    own_bytes_if(own_copy_on(), offset, base, first, count, element, stride, unknown)
+#[allow(clippy::too_many_arguments)]
+fn own_bytes(
+    offset: u64,
+    base: u64,
+    first: u64,
+    count: u32,
+    element: u64,
+    stride: u32,
+    unknown: bool,
+    raw: bool,
+) -> Option<(u64, u64)> {
+    own_bytes_if(own_copy_on(), offset, base, first, count, element, stride, unknown, raw)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2558,21 +2568,40 @@ fn own_bytes_if(
     element: u64,
     stride: u32,
     unknown: bool,
+    raw: bool,
 ) -> Option<(u64, u64)> {
-    if !on || element == 0 || count == 0 || offset.is_multiple_of(element) {
+    if !on || element == 0 || count == 0 {
+        return None;
+    }
+    let bytes = u64::from(count).checked_mul(element)?;
+    // PC D3D12 requires raw buffer views (`ByteAddressBuffer` / `RWByteAddressBuffer`)
+    // to start on a 16-byte boundary (`(offset + first * 4) % 16 == 0`), whereas
+    // Xbox permits 4-byte alignment (observed in logs: `format=39 first=2` / `first=1615`).
+    // Give bounded unaligned raw views their own copy starting at `base + first * 4`
+    // so host `FirstElement == 0` satisfies D3D12 instead of falling back to null.
+    const MAX_RAW_OWN_COPY: u64 = 16 << 20;
+    let raw_unaligned = raw
+        && element == 4
+        && bytes <= MAX_RAW_OWN_COPY
+        && !first
+            .checked_mul(4)
+            .and_then(|f| f.checked_add(offset))
+            .is_some_and(|a| a.is_multiple_of(16));
+    if !raw_unaligned && offset.is_multiple_of(element) {
         return None;
     }
     if unknown && raw_window(offset, first, count, stride).is_some() {
         return None;
     }
     let start = base.checked_add(first.checked_mul(element)?)?;
-    Some((start, u64::from(count) * element))
+    Some((start, bytes))
 }
 
 /// Of a buffer view: its first element, its elements, the bytes of one (a
-/// raw view's: 4), its structure's stride, and whether it has no format.
+/// raw view's: 4), its structure's stride, whether it has no format, and
+/// whether it is a raw byte-address view.
 /// As [`buffer_srv`] and [`buffer_uav`] read them from the same words.
-fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool)> {
+fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool, bool)> {
     const BUFFER: u32 = 1;
     let (words, unordered): (&[u32; 10], bool) = match view {
         View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
@@ -2584,19 +2613,21 @@ fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool)> {
         let d = uav_desc(words);
         // SAFETY: a buffer view's union member.
         let b = unsafe { d.Anonymous.Buffer };
+        let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
         let element = if b.StructureByteStride > 0 {
             u64::from(b.StructureByteStride)
-        } else if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+        } else if raw {
             4
         } else {
             crate::resource::element(d.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
         };
-        Some((b.FirstElement, b.NumElements, element, b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN))
+        Some((b.FirstElement, b.NumElements, element, b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN, raw))
     } else {
         let d = srv_desc(words);
         // SAFETY: a buffer view's union member.
         let b = unsafe { d.Anonymous.Buffer };
-        Some((b.FirstElement, b.NumElements, element_size(&d), b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN))
+        let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+        Some((b.FirstElement, b.NumElements, element_size(&d), b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN, raw))
     }
 }
 
@@ -2672,7 +2703,8 @@ fn buffer_srv(
         // SAFETY: a buffer view's union member.
         let b = unsafe { desc.Anonymous.Buffer };
         let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
-        match own_bytes(offset, address, b.FirstElement, b.NumElements, element_size(&desc), b.StructureByteStride, unknown)
+        let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+        match own_bytes(offset, address, b.FirstElement, b.NumElements, element_size(&desc), b.StructureByteStride, unknown, raw)
             .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
         {
             Some(own) => {
@@ -2758,15 +2790,16 @@ fn buffer_uav(
     let (shadow, own) = {
         // SAFETY: a buffer view's union member.
         let b = unsafe { desc.Anonymous.Buffer };
+        let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
         let element = if b.StructureByteStride > 0 {
             u64::from(b.StructureByteStride)
-        } else if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+        } else if raw {
             4
         } else {
             crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
         };
         let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
-        match own_bytes(shadow.offset(address), address, b.FirstElement, b.NumElements, element, b.StructureByteStride, unknown)
+        match own_bytes(shadow.offset(address), address, b.FirstElement, b.NumElements, element, b.StructureByteStride, unknown, raw)
             .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
         {
             Some(own) => {
@@ -4529,20 +4562,29 @@ mod own_copy_tests {
         let base = 0xd_9000_0000u64;
         // On an element: the buffer's copy (the two cases of every run's
         // log are the ones below).
-        assert_eq!(own_bytes_if(true, 24, base, 3, 10, 12, 0, false), None);
-        assert_eq!(own_bytes_if(true, 0, base, 0, 10, 12, 0, false), None);
+        assert_eq!(own_bytes_if(true, 24, base, 3, 10, 12, 0, false, false), None);
+        assert_eq!(own_bytes_if(true, 0, base, 0, 10, 12, 0, false, false), None);
         // A typed view of 12-byte elements, 5,222,240 bytes into its copy
         // (8 past an element): its own bytes, from its first element.
-        assert_eq!(own_bytes_if(true, 5_222_240, base, 3, 10, 12, 0, false), Some((base + 36, 120)));
+        assert_eq!(own_bytes_if(true, 5_222_240, base, 3, 10, 12, 0, false, false), Some((base + 36, 120)));
         // A structured view of 32-byte elements 8 bytes in: not on 16, so
         // no raw view of the copy either.
-        assert_eq!(own_bytes_if(true, 8, base, 2, 4, 32, 32, true), Some((base + 64, 128)));
+        assert_eq!(own_bytes_if(true, 8, base, 2, 4, 32, 32, true, false), Some((base + 64, 128)));
         // The same 16 bytes in: off its elements, but a raw view of the
         // copy's bytes does (as before).
-        assert_eq!(own_bytes_if(true, 16, base, 2, 4, 32, 32, true), None);
+        assert_eq!(own_bytes_if(true, 16, base, 2, 4, 32, 32, true, false), None);
+        // Raw views with 4-byte-aligned but non-16-byte-aligned start (real log
+        // cases: `format=39 first=2 count=32` and `first=1615 count=4064`) get
+        // their own copy so host `FirstElement == 0` is 16-byte aligned; aligned
+        // raw views stay on their buffer's copy.
+        assert_eq!(own_bytes_if(true, 0, base, 2, 32, 4, 0, false, true), Some((base + 8, 128)));
+        assert_eq!(own_bytes_if(true, 0, base, 1615, 4064, 4, 0, false, true), Some((base + 6460, 16256)));
+        assert_eq!(own_bytes_if(true, 8, base, 2, 32, 4, 0, false, true), None); // 8 + 8 = 16 -> aligned
+        assert_eq!(own_bytes_if(true, 0, base, 4, 32, 4, 0, false, true), None); // 16 -> aligned
         // No elements, no size, or the switch off: as before.
-        assert_eq!(own_bytes_if(true, 8, base, 2, 0, 32, 32, true), None);
-        assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
-        assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
+        assert_eq!(own_bytes_if(true, 8, base, 2, 0, 32, 32, true, false), None);
+        assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false, false), None);
+        assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true, false), None);
+        assert_eq!(own_bytes_if(false, 0, base, 2, 32, 4, 0, false, true), None);
     }
 }

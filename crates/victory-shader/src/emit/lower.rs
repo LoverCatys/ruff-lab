@@ -5048,7 +5048,7 @@ impl<'a> Lower<'a> {
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
         let r = match &inst.fields {
-            Fields::Sop { .. } => self.sop(inst),
+            Fields::Sop { .. } => self.sop(inst, b, i),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
                 // Thread-group sync with a shared-memory fence, and a UAV
@@ -5205,7 +5205,7 @@ impl<'a> Lower<'a> {
         v.is_some_and(|v| self.x.st.masks.contains_key(&v))
     }
 
-    fn sop(&mut self, inst: &Inst) -> Result<(), Why> {
+    fn sop(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Sop { dst, src, imm } = &inst.fields else {
             unreachable!()
         };
@@ -5216,6 +5216,23 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
+        // Waterfall loop tail (PR #3016 / Issue #3253): `s_andn2_wrexec_b32/_b64`
+        // right before `s_cbranch_execnz` back to the same block only exits the
+        // loop when `EXEC == 0`, so `SCC` seen after the loop is always `false`.
+        if matches!(name, "s_andn2_wrexec_b32" | "s_andn2_wrexec_b64") {
+            let block = &self.x.p.blocks[b];
+            let loops_back = i + 2 == block.insts.len()
+                && block.insts[i + 1].name() == "s_cbranch_execnz"
+                && matches!(block.exit, Exit::Branch { taken, .. } if taken == b);
+            let scc_in_loop_phi = scc.is_some_and(|v| {
+                block.phis.iter().any(|phi| phi.args.contains(&v))
+            });
+            if loops_back && !scc_in_loop_phi {
+                let f = self.s.m.bool(false);
+                self.set(scc, Val::Bit(f));
+                return Ok(());
+            }
+        }
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
             return Err(LANE_MASK);
         }
@@ -11348,7 +11365,9 @@ impl<'a> Lower<'a> {
         });
         let mut indices = [z; 3];
         for (k, slot) in indices.iter_mut().enumerate() {
-            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x3FF));
+            // GFX10 `exp prim` packs three 9-bit vertex indices (bits 0..8,
+            // 10..18, 20..28) with edge flags in bits 9, 19, 29 (`c0228d9`).
+            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             if let Some(n) = written {

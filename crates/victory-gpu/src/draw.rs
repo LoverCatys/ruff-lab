@@ -1086,6 +1086,17 @@ impl State {
         }
         if indexed {
             let v = self.index;
+            // Validate index buffer before looking up a shadow copy (PR #3183):
+            // address 0 or unsupported formats would otherwise leak a 4 MiB
+            // loose buffer at 0 or trigger D3D12 validation errors.
+            let align = match v.format {
+                57 => 2u64, // DXGI_FORMAT_R16_UINT
+                42 => 4u64, // DXGI_FORMAT_R32_UINT
+                _ => 0u64,
+            };
+            if align == 0 || v.address == 0 || u64::from(v.size) < align || v.address % align != 0 {
+                return false;
+            }
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
                 return false;
             };

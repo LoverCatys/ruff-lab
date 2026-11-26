@@ -57,11 +57,14 @@ impl Cache {
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
         let dir = path.parent().expect("hashed path has a parent");
         std::fs::create_dir_all(dir)?;
-        // Write-then-rename so readers never see partial output.
+        // Write-then-rename so readers never see partial output. Truncate
+        // instead of `create_new` so leftover `.tmp-<pid>-*` files after a
+        // killed process whose PID Windows reuses never break caching (#1321).
         let tmp = tempfile_in(dir);
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(true)
             .open(&tmp)?;
         let written = file.write_all(&output);
         drop(file);

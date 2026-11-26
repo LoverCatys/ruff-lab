@@ -469,7 +469,17 @@ fn workers() -> bool {
                     loop {
                         let (p, compute) = next();
                         let _slot = ComputeSlot(compute);
-                        p.make();
+                        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.make())) {
+                            let msg = payload
+                                .downcast_ref::<&str>()
+                                .copied()
+                                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                                .unwrap_or("unknown panic");
+                            tracing::error!(panic = msg, "pipeline worker caught panic; marking pipeline refused");
+                            let _ = p.made.set(None);
+                            let _lock = DONE.0.lock().unwrap_or_else(|e| e.into_inner());
+                            DONE.1.notify_all();
+                        }
                         if !compute {
                             WAITING_GFX.fetch_sub(1, Ordering::Relaxed);
                         }

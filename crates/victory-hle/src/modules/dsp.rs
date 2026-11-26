@@ -18,6 +18,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use super::xasync::E_INVALIDARG;
@@ -51,16 +52,17 @@ pub struct StreamDesc {
 /// The status block a stream's owner polls.
 #[repr(C)]
 pub struct Status {
-    submitted: u32,
-    completed: u32,
-    reserved: u32,
-    result: HRESULT,
+    submitted: AtomicU32,
+    completed: AtomicU32,
+    reserved: AtomicU32,
+    result: AtomicI32,
 }
 
 pub struct Stream {
     dsp: *mut Dsp,
     frames: u32,
     channels: u32,
+    lock: Mutex<()>,
     status: Box<Status>,
 }
 
@@ -168,11 +170,12 @@ pub extern "system" fn XDspActivate(
         dsp,
         frames: desc.frames,
         channels: desc.channels,
+        lock: Mutex::new(()),
         status: Box::new(Status {
-            submitted: 0,
-            completed: 0,
-            reserved: 0,
-            result: S_OK,
+            submitted: AtomicU32::new(0),
+            completed: AtomicU32::new(0),
+            reserved: AtomicU32::new(0),
+            result: AtomicI32::new(S_OK),
         }),
     });
     // SAFETY: checked non-null.
@@ -204,21 +207,19 @@ pub extern "system" fn XDspSubmitCommand(
     if stream.is_null() || command.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: a stream from `XDspActivate`, the title's command.
-    let (stream, command) = unsafe { (&mut *stream, &*command) };
+    // SAFETY: a stream from `XDspActivate`, the title's command; shared ref
+    // synchronized via `stream.lock` to avoid cross-thread `&mut` UB (PR #3319).
+    let (stream, command) = unsafe { (&*stream, &*command) };
+    let _guard = stream.lock.lock().unwrap_or_else(|e| e.into_inner());
     if !command.output.is_null() {
         let samples = (stream.frames * stream.channels) as usize;
         // SAFETY: the title's output buffer holds one block of the stream.
         unsafe { std::ptr::write_bytes(command.output, 0, samples) };
     }
-    let status = &mut *stream.status;
-    let next = status.submitted.wrapping_add(1);
-    // SAFETY: the status block is read by title code on other threads.
-    unsafe {
-        std::ptr::write_volatile(&mut status.submitted, next);
-        std::ptr::write_volatile(&mut status.result, S_OK);
-        std::ptr::write_volatile(&mut status.completed, next);
-    }
+    let next = stream.status.submitted.load(Ordering::Relaxed).wrapping_add(1);
+    stream.status.submitted.store(next, Ordering::Release);
+    stream.status.result.store(S_OK, Ordering::Release);
+    stream.status.completed.store(next, Ordering::Release);
     if !ticket.is_null() {
         // SAFETY: optional out parameter.
         unsafe { ticket.write(next) };
@@ -282,7 +283,12 @@ mod tests {
         let mut ticket = 0;
         assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
         // SAFETY: the stream's status block.
-        let (completed, result) = unsafe { ((*status).completed, (*status).result) };
+        let (completed, result) = unsafe {
+            (
+                (*status).completed.load(Ordering::Acquire),
+                (*status).result.load(Ordering::Acquire),
+            )
+        };
         assert_eq!((completed, result), (ticket, S_OK));
         assert!(output.iter().all(|&s| s == 0.0));
         assert_eq!(XDspDeactivate(stream), S_OK);
