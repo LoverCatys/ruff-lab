@@ -665,6 +665,11 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    /// Footprint dimensions `(width, height, depth)` in texels.
+    pub(crate) fn extent(&self) -> (u32, u32, u32) {
+        (self.width, self.height, self.depth)
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
@@ -1328,7 +1333,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         const TEXTURE_2D: u32 = 3;
         let mut tiled = None;
         let mut texture = None;
-        let planned_drop = drop_levels(&r.desc, r.host.placed.load(Relaxed), clear.is_null());
+        let planned_drop = if alias_of(this).is_some() {
+            0
+        } else {
+            drop_levels(&r.desc, r.host.placed.load(Relaxed), clear.is_null())
+        };
         let shape_fits = fills(&r.desc)
             && r.desc.dimension == TEXTURE_2D
             && r.desc.depth_or_array_size == 1
@@ -1639,16 +1648,24 @@ pub(crate) fn dropped(this: This) -> u32 {
     made.as_ref().map_or(0, |(host, _)| host.dropped)
 }
 
-/// Adjusts a shader view's mip range when the host texture omits `dropped` largest mips.
-pub(crate) fn shift_levels(dropped: u32, first: &mut u32, levels: &mut u32, clamp: &mut f32) {
-    if dropped == 0 {
+/// Adjusts a shader view's mip range when the host texture omits `dropped` largest mips
+/// and has `host_mips` levels left.
+pub(crate) fn shift_levels(
+    dropped: u32,
+    host_mips: u32,
+    first: &mut u32,
+    levels: &mut u32,
+    clamp: &mut f32,
+) {
+    if dropped == 0 || host_mips == 0 {
         return;
     }
+    let skipped = dropped.saturating_sub(*first);
+    *first = first.saturating_sub(dropped).min(host_mips - 1);
     if *levels != u32::MAX {
-        let end = first.saturating_add(*levels);
-        *levels = end.saturating_sub(dropped.max(*first)).max(1);
+        let max_left = host_mips - *first;
+        *levels = levels.saturating_sub(skipped).clamp(1, max_left);
     }
-    *first = first.saturating_sub(dropped);
     *clamp = (*clamp - dropped as f32).max(0.0);
 }
 
@@ -4516,11 +4533,14 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(levels_to_drop(10, 64, 64, 7), 4); // 64 / (4 << 4) == 1
         assert_eq!(levels_to_drop(2, 1024, 1024, 1), 0); // at least 1 mip left
         let (mut first, mut levels, mut clamp) = (0, u32::MAX, 2.5);
-        shift_levels(2, &mut first, &mut levels, &mut clamp);
+        shift_levels(2, 10, &mut first, &mut levels, &mut clamp);
         assert_eq!((first, levels, clamp), (0, u32::MAX, 0.5));
         let (mut first, mut levels, mut clamp) = (1, 4, 1.0);
-        shift_levels(2, &mut first, &mut levels, &mut clamp);
+        shift_levels(2, 10, &mut first, &mut levels, &mut clamp);
         assert_eq!((first, levels, clamp), (0, 3, 0.0));
+        let (mut first, mut levels, mut clamp) = (12, 4, 0.0);
+        shift_levels(2, 8, &mut first, &mut levels, &mut clamp);
+        assert_eq!((first, levels, clamp), (7, 1, 0.0));
     }
 
     #[test]

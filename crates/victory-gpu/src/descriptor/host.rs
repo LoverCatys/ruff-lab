@@ -2998,8 +2998,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     };
                     crate::tiles::show_from(desc.get_or_insert(whole), first, u32::from(own.MipLevels));
                 }
-                if let Some(d) = desc.as_mut() {
-                    shift_view_levels(crate::resource::dropped(resource), d);
+                let dropped = crate::resource::dropped(resource);
+                if dropped > 0
+                    && let Some(d) = desc.as_mut()
+                {
+                    // SAFETY: a live host texture.
+                    let host_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                    shift_view_levels(dropped, host_mips, d);
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -3305,8 +3310,8 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 /// Shifts a shader view's mip levels down when the host texture omits its
 /// `dropped` largest mips (`crate::resource::drop_levels`).
-fn shift_view_levels(dropped: u32, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) {
-    if dropped == 0 {
+fn shift_view_levels(dropped: u32, host_mips: u32, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) {
+    if dropped == 0 || host_mips == 0 {
         return;
     }
     let shift = crate::resource::shift_levels;
@@ -3315,19 +3320,19 @@ fn shift_view_levels(dropped: u32, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) {
         match desc.ViewDimension {
             D3D12_SRV_DIMENSION_TEXTURE2D => {
                 let t = &mut desc.Anonymous.Texture2D;
-                shift(dropped, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+                shift(dropped, host_mips, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
             }
             D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
                 let t = &mut desc.Anonymous.Texture2DArray;
-                shift(dropped, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+                shift(dropped, host_mips, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
             }
             D3D12_SRV_DIMENSION_TEXTURECUBE => {
                 let t = &mut desc.Anonymous.TextureCube;
-                shift(dropped, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+                shift(dropped, host_mips, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
             }
             D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
                 let t = &mut desc.Anonymous.TextureCubeArray;
-                shift(dropped, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+                shift(dropped, host_mips, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
             }
             _ => {}
         }

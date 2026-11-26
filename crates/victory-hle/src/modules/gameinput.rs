@@ -137,6 +137,30 @@ fn fallback(keys: &[KeyState]) -> PadState {
     }
 }
 
+/// Two pads as one: buttons of both, and of each axis and trigger the one
+/// pushed further.
+fn merged(a: PadState, b: PadState) -> PadState {
+    let further = |x: f32, y: f32| if y.abs() > x.abs() { y } else { x };
+    PadState {
+        buttons: a.buttons | b.buttons,
+        left_trigger: further(a.left_trigger, b.left_trigger),
+        right_trigger: further(a.right_trigger, b.right_trigger),
+        left_x: further(a.left_x, b.left_x),
+        left_y: further(a.left_y, b.left_y),
+        right_x: further(a.right_x, b.right_x),
+        right_y: further(a.right_y, b.right_y),
+    }
+}
+
+/// Whether the title sees one pad that is always there, fed by the keyboard
+/// and by every host pad (on by default; `VICTORY_ONE_PAD=0` shows each host
+/// pad as a device of its own, and the stand-in only while there is none).
+/// Keeps GTA VI from pausing on "Controller disconnected" when unplugging and
+/// re-plugging a controller (DS4/DualSense/XInput).
+fn one_pad() -> bool {
+    std::env::var_os("VICTORY_ONE_PAD").is_none_or(|v| v != "0")
+}
+
 #[repr(C)]
 struct Table<const N: usize>([*const (); N]);
 // SAFETY: function addresses only.
@@ -333,6 +357,8 @@ pub struct Hub {
     /// Apart from the state: XInput can be slow, and the title reads
     /// readings every frame.
     source: Mutex<Box<dyn Source>>,
+    /// The title sees one always-connected pad ([`one_pad`]).
+    one_pad: bool,
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
@@ -356,7 +382,7 @@ fn now() -> u64 {
 }
 
 impl Hub {
-    fn new(source: Box<dyn Source>) -> &'static Hub {
+    fn new(source: Box<dyn Source>, one_pad: bool) -> &'static Hub {
         let hub = Box::into_raw(Box::new(Hub {
             object: Object {
                 vtable: &INPUT,
@@ -364,6 +390,7 @@ impl Hub {
             },
             devices: std::array::from_fn(Device::new),
             source: Mutex::new(source),
+            one_pad,
             state: Mutex::new(State {
                 slots: Default::default(),
                 callbacks: Vec::new(),
@@ -384,7 +411,7 @@ impl Hub {
 
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
-        let hub = Hub::new(source);
+        let hub = Hub::new(source, one_pad());
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -406,7 +433,7 @@ impl Hub {
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             (pads, source.keys())
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
         self.deliver(events);
     }
 
@@ -449,11 +476,18 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
+        one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        if one_pad {
+            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
+            self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
+            return events;
+        }
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
@@ -915,7 +949,8 @@ extern "system" fn device_status(this: *const Device) -> u32 {
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
-    if device.index >= PADS {
+    let one_pad = device.hub().one_pad;
+    if device.index >= PADS && !(one_pad && device.index == FALLBACK) {
         return;
     }
     let [low, high, ..] = if params.is_null() {
@@ -925,7 +960,16 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
         unsafe { *params }
     };
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    let mut source = lock(&device.hub().source);
+    if one_pad {
+        for slot in 0..PADS {
+            if source.pad(slot).is_some() {
+                source.rumble(slot, speed(low), speed(high));
+            }
+        }
+    } else {
+        source.rumble(device.index, speed(low), speed(high));
+    }
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -1318,7 +1362,7 @@ mod tests {
 
     fn fake() -> (&'static Hub, Arc<Mutex<FakeHost>>) {
         let host = Arc::new(Mutex::new(FakeHost::default()));
-        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))));
+        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))), false);
         hub.poll();
         (hub, host)
     }
@@ -1640,5 +1684,50 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    #[test]
+    fn one_pad_merges_and_never_disconnects_on_replug() {
+        let host = Arc::new(Mutex::new(FakeHost::default()));
+        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))), true);
+        hub.poll();
+        let log = Log::default();
+        register(hub, GAMEPAD_KIND, 2, &log);
+        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
+
+        // Plug in pad 0, unplug it, re-plug it: zero disconnect/connect churn.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: A,
+            left_x: 0.75,
+            ..Default::default()
+        });
+        host.lock().unwrap().keys = vec![key(b'W')];
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let state = pad(r);
+        assert_eq!(state.buttons, A);
+        assert_eq!(state.left_x, 0.75);
+        assert_eq!(state.left_y, 1.0);
+        release(r);
+
+        // Rumble sent to FALLBACK reaches connected physical pad 0.
+        type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
+        let device = &hub.devices[FALLBACK] as *const Device;
+        let rumble = slot::<Rumble, _>(device, 0x50);
+        rumble(device, &[0.5, 1.0, 0.0, 0.0]);
+        assert_eq!(host.lock().unwrap().rumble, [(0, 32767, 65535)]);
+
+        host.lock().unwrap().pads[0] = None;
+        hub.poll();
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: B,
+            ..Default::default()
+        });
+        hub.poll();
+        assert_eq!(
+            *log.lock().unwrap(),
+            [(FALLBACK, STATUS_CONNECTED, 0)],
+            "replugging must not disconnect FALLBACK"
+        );
     }
 }
