@@ -1647,6 +1647,11 @@ struct CardWork {
     /// The fetch inside flights ([`inflight_fetch`]), if it is on and was
     /// made.
     inflight: Option<CardInflight>,
+    /// Masked upload compute pass (`VICTORY_UNDER_WRITES_MASKS=1`) that turns
+    /// hundreds of thousands of tiny CopyBufferRegion calls into 1-2 dispatches.
+    patch: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
+    /// Reusable mapped buffers holding 4 KiB byte-masks for `patch`.
+    masks: Vec<(ID3D12Resource, usize, u64)>,
 }
 
 /// What the fetch inside flights needs ([`inflight_fetch`], [`CARD_FETCH`]).
@@ -1813,6 +1818,124 @@ unsafe fn dispatch_card_compare(
         }
         done += chunk;
     }
+}
+
+/// Masked byte-level upload compute pass (`VICTORY_UNDER_WRITES_MASKS=1`):
+/// copies only the bytes whose bit is set in `masks` for each 4 KiB block,
+/// collapsing hundreds of thousands of tiny `CopyBufferRegion` calls into 1-2
+/// compute dispatches without disturbing adjacent shader writes.
+const CARD_PATCH: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), SRV(t1), UAV(u0)"
+cbuffer Blocks : register(b0) {
+    uint table_at;
+    uint blocks;
+};
+ByteAddressBuffer from : register(t0);
+ByteAddressBuffer masks : register(t1);
+RWByteAddressBuffer to : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint slot = id.x >> 10;
+    if (slot >= blocks) return;
+    uint word = id.x & 1023u;
+    uint2 entry = masks.Load2(table_at + slot * 8u);
+    uint bits = (masks.Load(entry.y + (word >> 3) * 4u) >> ((word & 7u) * 4u)) & 15u;
+    if (bits == 0u) return;
+    uint keep = ((bits & 1u) != 0u ? 0x000000FFu : 0u) | ((bits & 2u) != 0u ? 0x0000FF00u : 0u)
+              | ((bits & 4u) != 0u ? 0x00FF0000u : 0u) | ((bits & 8u) != 0u ? 0xFF000000u : 0u);
+    uint a = entry.x + word * 4u;
+    to.Store(a, (to.Load(a) & ~keep) | (from.Load(a) & keep));
+}
+"#;
+
+/// Whether small dirty ranges go up via [`CARD_PATCH`] (`VICTORY_UNDER_WRITES_MASKS`,
+/// default ON; `0` disables).
+fn under_writes_masks() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNDER_WRITES_MASKS").is_none_or(|v| v != "0"))
+}
+
+/// Minimum ranges in a 4 KiB block before it uses [`CARD_PATCH`]
+/// (`VICTORY_UNDER_WRITES_MASKS_LEAST`, default `1`).
+fn masks_least() -> usize {
+    static LEAST: OnceLock<usize> = OnceLock::new();
+    *LEAST.get_or_init(|| {
+        std::env::var("VICTORY_UNDER_WRITES_MASKS_LEAST")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1)
+            .max(1)
+    })
+}
+
+/// Splits ordered non-touching dirty ranges into large `CopyBufferRegion` copies
+/// and 4 KiB blocks sent via [`CARD_PATCH`].
+fn masked_blocks(
+    ranges: &[(usize, usize)],
+    least: usize,
+) -> (Vec<(usize, usize)>, Vec<(usize, Vec<(usize, usize)>)>) {
+    const BLOCK: usize = 4096;
+    let mut copies = Vec::new();
+    let mut blocks: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+    if least <= 1 {
+        for &(a, b) in ranges {
+            if b <= a {
+                continue;
+            }
+            if b - a >= 2 * BLOCK {
+                copies.push((a, b));
+                continue;
+            }
+            let mut at = a;
+            while at < b {
+                let block = at / BLOCK;
+                let end = ((block + 1) * BLOCK).min(b);
+                match blocks.last_mut() {
+                    Some(last) if last.0 == block => last.1.push((at, end)),
+                    _ => blocks.push((block, vec![(at, end)])),
+                }
+                at = end;
+            }
+        }
+        return (copies, blocks);
+    }
+    let mut i = 0;
+    while i < ranges.len() {
+        let (a, b) = ranges[i];
+        let block = a / BLOCK;
+        if b <= a || (b - 1) / BLOCK != block {
+            copies.push((a, b));
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < ranges.len()
+            && ranges[j].0 / BLOCK == block
+            && ranges[j].1 > ranges[j].0
+            && (ranges[j].1 - 1) / BLOCK == block
+        {
+            j += 1;
+        }
+        if j - i >= least {
+            blocks.push((block, ranges[i..j].to_vec()));
+        } else {
+            copies.extend_from_slice(&ranges[i..j]);
+        }
+        i = j;
+    }
+    (copies, blocks)
+}
+
+/// Builds the 512-byte bitmask for one 4 KiB block in [`CARD_PATCH`].
+fn block_mask(block: usize, ranges: &[(usize, usize)]) -> [u8; 512] {
+    let mut mask = [0u8; 512];
+    for &(a, b) in ranges {
+        for at in a - block * 4096..b - block * 4096 {
+            mask[at / 8] |= 1 << (at % 8);
+        }
+    }
+    mask
 }
 
 /// Whether the pieces a flight's compare flags come down to the PC inside
@@ -2023,6 +2146,8 @@ struct CardPlan {
     /// The `CardInflight::landed` its [`CARD_FETCH`] was told: which of its
     /// tickets got a slot ([`inflight_gets_slot`]).
     inflight_landed: u32,
+    /// Mask buffer used by this plan's masked upload pass (`card_done` recycles it).
+    masks: Option<(ID3D12Resource, usize, u64)>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -3591,6 +3716,7 @@ impl Host {
                 },
                 ..Default::default()
             })?;
+            let patch = under_writes_masks().then(|| self.make_card_patch()).flatten();
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
@@ -3602,7 +3728,58 @@ impl Host {
                 taken: 0,
                 out: 0,
                 inflight: if inflight_fetch() { self.make_card_inflight(RESULTS) } else { None },
+                patch,
+                masks: Vec::new(),
             })
+        }
+    }
+
+    /// Compiles [`CARD_PATCH`] for masked small-range uploads.
+    fn make_card_patch(&self) -> Option<(ID3D12RootSignature, ID3D12PipelineState)> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let made = (|| -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: constant shader source and entry point; root signature is embedded.
+            unsafe {
+                D3DCompile(
+                    CARD_PATCH.as_ptr().cast(),
+                    CARD_PATCH.len(),
+                    windows::core::s!("card patch"),
+                    None,
+                    None,
+                    windows::core::s!("main"),
+                    windows::core::s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )?;
+                let code = code.ok_or_else(windows::core::Error::empty)?;
+                let bytes = std::slice::from_raw_parts(
+                    code.GetBufferPointer().cast::<u8>(),
+                    code.GetBufferSize(),
+                );
+                let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+                let pso: ID3D12PipelineState =
+                    self.device
+                        .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                            pRootSignature: std::mem::transmute_copy(&root),
+                            CS: D3D12_SHADER_BYTECODE {
+                                pShaderBytecode: bytes.as_ptr().cast(),
+                                BytecodeLength: bytes.len(),
+                            },
+                            ..Default::default()
+                        })?;
+                Ok((root, pso))
+            }
+        })();
+        match made {
+            Ok(patch) => Some(patch),
+            Err(e) => {
+                tracing::warn!(error = %e, "VICTORY_UNDER_WRITES_MASKS: masked pass could not be compiled");
+                None
+            }
         }
     }
 
@@ -3744,11 +3921,67 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        let mut masks: Option<(ID3D12Resource, usize, u64)> = None;
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
             let (allocator, list) = &sync;
+            type Sends = (Vec<(usize, usize)>, Vec<(usize, usize)>);
+            let mut sends: Vec<Sends> = dirty.iter().map(|(_, ranges)| (ranges.clone(), Vec::new())).collect();
+            if work.patch.is_some() {
+                let split: Vec<_> = dirty
+                    .iter()
+                    .map(|(_, ranges)| masked_blocks(ranges, masks_least()))
+                    .collect();
+                let blocks: usize = split.iter().map(|s| s.1.len()).sum();
+                if blocks > 0 {
+                    let need = (blocks as u64 * (512 + 8)).next_multiple_of(64 << 10);
+                    let have = match work.masks.iter().position(|m| m.2 >= need) {
+                        Some(i) => Some(work.masks.swap_remove(i)),
+                        None => self.shared_buffer(need).map(|(buffer, data)| {
+                            name(&buffer, || "card patch masks".into());
+                            (buffer, data as usize, need)
+                        }),
+                    };
+                    if let Some((buffer, data, bytes)) = have {
+                        let mut at = 0usize;
+                        for (send, (copies, masked)) in sends.iter_mut().zip(split) {
+                            let mut entries: Vec<[u32; 2]> = Vec::with_capacity(masked.len());
+                            for (block, ranges) in &masked {
+                                let mask = block_mask(*block, ranges);
+                                // SAFETY: `bytes >= need` covers all `blocks` masks and entries;
+                                // buffer is idle (new or recycled via `card_done`).
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        mask.as_ptr(),
+                                        (data + at) as *mut u8,
+                                        512,
+                                    )
+                                };
+                                entries.push([(*block * 4096) as u32, at as u32]);
+                                at += 512;
+                            }
+                            let mut runs: Vec<(usize, usize)> = Vec::new();
+                            for pass in entries.chunks(4000) {
+                                // SAFETY: `pass` entries fit inside `bytes` as computed above.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        pass.as_ptr().cast::<u8>(),
+                                        (data + at) as *mut u8,
+                                        pass.len() * 8,
+                                    )
+                                };
+                                runs.push((at, pass.len()));
+                                at += pass.len() * 8;
+                            }
+                            *send = (copies, runs);
+                        }
+                        debug_assert!(at as u64 <= bytes);
+                        masks = Some((buffer, data, bytes));
+                    }
+                }
+            }
             // SAFETY: the list's last run finished (it ran ahead of a
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
@@ -3756,31 +3989,60 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    // Pass 1: copy all dirty ranges and emit one deduplicated
-                    // COPY_DEST -> NON_PIXEL_SHADER_RESOURCE barrier per buffer
-                    // (coolfox 641835a4 / VIctory-7900XTX 773d902).
+                    // Pass 1: copy large dirty ranges via CopyBufferRegion and
+                    // small/crowded 4 KiB blocks via CARD_PATCH compute pass.
                     let mut sent = Vec::new();
                     let mut transitioned = Vec::new();
                     let mut to_hash = Vec::new();
-                    for (shadow, ranges) in &dirty {
+                    let mut patch_bound = false;
+                    for ((shadow, ranges), (copies, masked)) in dirty.iter().zip(&sends) {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
-                        for &(a, b) in ranges {
+                        for &(a, b) in copies {
                             list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
-                            crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
+                        crate::shadow::CARD_STATS[0].fetch_add(
+                            ranges.iter().map(|&(a, b)| (b - a) as u64).sum::<u64>(),
+                            Ordering::Relaxed,
+                        );
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        let mut state = (!copies.is_empty()).then_some(D3D12_RESOURCE_STATE_COPY_DEST);
+                        if let (false, Some((root, pso)), Some((mask_buffer, _, _))) =
+                            (masked.is_empty(), work.patch.as_ref(), masks.as_ref())
+                        {
+                            if let Some(from) = state {
+                                list.ResourceBarrier(&[transition(
+                                    &shadow.buffer,
+                                    from,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                )]);
+                            }
+                            state = Some(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                            if !patch_bound {
+                                list.SetComputeRootSignature(root);
+                                list.SetPipelineState(pso);
+                                list.SetComputeRootShaderResourceView(2, mask_buffer.GetGPUVirtualAddress());
+                                patch_bound = true;
+                            }
+                            list.SetComputeRootShaderResourceView(1, staging.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(3, shadow.buffer.GetGPUVirtualAddress());
+                            for &(table_at, blocks) in masked {
+                                let constants = [table_at as u32, blocks as u32];
+                                list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                                list.Dispatch(16 * blocks as u32, 1, 1);
+                            }
+                        }
                         let Some(before) = before else {
                             continue;
                         };
-                        if !ranges.is_empty() {
+                        if let Some(from) = state {
                             let raw = shadow.buffer.as_raw();
                             if !transitioned.contains(&raw) {
                                 transitioned.push(raw);
                                 sent.push(transition(
                                     &shadow.buffer,
-                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    from,
                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                 ));
                             }
@@ -3831,6 +4093,7 @@ impl Host {
             sent_as,
             inflight: false,
             inflight_landed: 0,
+            masks,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -3968,6 +4231,11 @@ impl Host {
         };
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
+        }
+        if let Some(m) = plan.masks
+            && work.masks.len() < 16
+        {
+            work.masks.push(m);
         }
         work.out = work.out.saturating_sub(1);
         // With the relay other plans may be on the card, their results
@@ -8157,5 +8425,31 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 1_500);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 8_000);
+    }
+
+    #[test]
+    fn crowded_blocks_go_up_by_mask_and_the_rest_as_copies() {
+        use super::{block_mask, masked_blocks};
+        let ranges = [
+            (8, 12),
+            (100, 104),
+            (4090, 4100),
+            (4200, 4204),
+            (8192, 8196),
+            (8200, 8204),
+            (8300, 8301),
+            (12288, 22000),
+        ];
+        let (copies, blocks) = masked_blocks(&ranges, 3);
+        assert_eq!(copies, [(8, 12), (100, 104), (4090, 4100), (4200, 4204), (12288, 22000)]);
+        assert_eq!(blocks, [(2, vec![(8192, 8196), (8200, 8204), (8300, 8301)])]);
+        let (copies1, blocks1) = masked_blocks(&ranges, 1);
+        assert_eq!(copies1, [(12288, 22000)]);
+        assert_eq!(blocks1.iter().map(|b| b.0).collect::<Vec<_>>(), [0, 1, 2]);
+        let mask = block_mask(2, &[(8192, 8196), (8200, 8204), (8300, 8301)]);
+        assert_eq!(mask[0], 0x0f);
+        assert_eq!(mask[1], 0x0f);
+        assert_eq!(mask[(8300 - 8192) / 8], 1 << ((8300 - 8192) % 8));
+        assert_eq!(mask.iter().map(|m| m.count_ones()).sum::<u32>(), 9);
     }
 }

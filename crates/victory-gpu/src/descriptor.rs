@@ -177,11 +177,12 @@ pub(crate) fn sync_heaps() {
         return;
     }
     let started = std::time::Instant::now();
-    let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
-    let mut page_bytes: Vec<u8> = Vec::new();
+    let mut pages = 0u64;
+    let mut looked = 0u64;
+    let mut mirrored = 0u64;
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
-        // SAFETY: registered heaps are live (removed when dropped).
+        // SAFETY: registered heaps are live (removed when dropped under write lock).
         let heap = unsafe { &*(at as *const Heap) };
         let (Some(Some(host)), Some(written), Some(step)) =
             (heap.host.get(), &heap.written, increment(heap.desc.kind))
@@ -192,17 +193,26 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        let mut work: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 let from = page.max(range_from);
                 let to = (page + crate::watch::PAGE).min(range_end);
+                work.push((from, to));
+                page += crate::watch::PAGE;
+            }
+        }
+        let process = |chunk: &[(usize, usize)]| -> (u64, u64, u64) {
+            let (mut p, mut l, mut m) = (0u64, 0u64, 0u64);
+            let mut page_bytes: Vec<u8> = Vec::with_capacity(crate::watch::PAGE);
+            for &(from, to) in chunk {
                 // The page's records are read through the kernel, into a
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
                 page_bytes.resize(to - from, 0);
                 if crate::host::read_into(from as *const u8, &mut page_bytes) {
-                    pages += 1;
+                    p += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     for index in slots {
                         let handle = start + index * step;
@@ -214,16 +224,40 @@ pub(crate) fn sync_heaps() {
                         let Some(record) = page_bytes.get(at..at + step as usize) else {
                             continue;
                         };
-                        looked += 1;
+                        l += 1;
                         // Only a record that is not the one last seen there
                         // (`HostHeap::mirror_copied`).
                         if host.mirror_copied(index as u32, handle, record) {
-                            mirrored += 1;
+                            m += 1;
                         }
                     }
                 }
-                page += crate::watch::PAGE;
             }
+            (p, l, m)
+        };
+        if work.len() >= 16 {
+            let threads = std::thread::available_parallelism()
+                .map_or(4, |n| (n.get() / 2).clamp(2, 6))
+                .min(work.len() / 8)
+                .max(1);
+            let chunk_len = work.len().div_ceil(threads);
+            let totals: Vec<(u64, u64, u64)> = std::thread::scope(|s| {
+                let handles: Vec<_> = work
+                    .chunks(chunk_len)
+                    .map(|c| s.spawn(move || process(c)))
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap_or((0, 0, 0))).collect()
+            });
+            for (p, l, m) in totals {
+                pages += p;
+                looked += l;
+                mirrored += m;
+            }
+        } else {
+            let (p, l, m) = process(&work);
+            pages += p;
+            looked += l;
+            mirrored += m;
         }
     }
     drop(heaps);
