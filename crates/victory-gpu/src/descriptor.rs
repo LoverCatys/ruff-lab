@@ -1299,6 +1299,108 @@ mod tests {
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
+    /// Exercises the multi-threaded branch of `sync_heaps()` (`work.len() >= 16`)
+    /// across 32 dirty pages of a placed CBV/SRV/UAV heap and verifies every
+    /// written slot is mirrored without drops or clobbering untouched slots.
+    #[cfg(windows)]
+    #[test]
+    fn parallel_sync_heaps_mirrors_many_dirty_pages() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGES: usize = 32;
+        const STEP: usize = 32;
+        let bytes = PAGES * crate::watch::PAGE;
+        let slots_per_page = crate::watch::PAGE / STEP;
+        let count = (bytes / STEP) as u32;
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                bytes,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!memory.is_null());
+        let desc = HeapDesc {
+            kind: 0, // CBV_SRV_UAV
+            count,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address: memory as u64,
+            size: bytes as u64,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let mut src = [0u64; 4];
+            let src_at = src.as_mut_ptr() as u64;
+            let mut written_slots = Vec::new();
+            // Null SRVs (`View::Shader(0, None)`) are non-buffer views so
+            // `sync_heaps()` (`for_draw = false`) mirrors them immediately.
+            create_srv(std::ptr::null(), std::ptr::null(), std::ptr::null(), src_at);
+            for p in 0..PAGES {
+                let base = p * slots_per_page;
+                for off in [0usize, 7, slots_per_page - 1] {
+                    let idx = base + off;
+                    // SAFETY: `idx * STEP + STEP <= bytes`.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src_at as *const u8,
+                            memory.cast::<u8>().add(idx * STEP),
+                            STEP,
+                        );
+                    }
+                    written_slots.push(idx as u32);
+                }
+            }
+            for &idx in &written_slots {
+                assert!(!host.made(idx), "slot {idx} should not be mirrored before sync_heaps");
+            }
+            sync_heaps();
+            for &idx in &written_slots {
+                assert!(host.made(idx), "slot {idx} was missed by parallel sync_heaps");
+            }
+            // Untouched neighbor slots must remain unmade.
+            for p in 0..PAGES {
+                let untouched = (p * slots_per_page + 3) as u32;
+                assert!(!host.made(untouched), "untouched slot {untouched} unexpectedly mirrored");
+            }
+            // Second pass with no new writes must stay idempotent and clean.
+            sync_heaps();
+            // Third pass after mutating a subset of pages again with null UAVs.
+            create_uav(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                src_at,
+            );
+            for p in (0..PAGES).step_by(2) {
+                let idx = p * slots_per_page + 5;
+                // SAFETY: `idx * STEP + STEP <= bytes`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        src_at as *const u8,
+                        memory.cast::<u8>().add(idx * STEP),
+                        STEP,
+                    );
+                }
+            }
+            sync_heaps();
+            for p in (0..PAGES).step_by(2) {
+                let idx = (p * slots_per_page + 5) as u32;
+                assert!(host.made(idx), "updated slot {idx} was missed on second parallel sync");
+            }
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
     #[test]
     fn views_survive_copies() {
         let null = std::ptr::null();

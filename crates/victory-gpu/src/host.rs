@@ -8452,4 +8452,357 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(mask[(8300 - 8192) / 8], 1 << ((8300 - 8192) % 8));
         assert_eq!(mask.iter().map(|m| m.count_ones()).sum::<u32>(), 9);
     }
+
+    #[test]
+    fn card_patch_and_fetch_work_byte_exact_on_gpu() {
+        use super::{
+            block_mask, host, masked_blocks, transition, D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, INFINITE, Interface, WaitForSingleObject,
+        };
+        let Some(host) = host() else {
+            return;
+        };
+        let (root, pso) = host.make_card_patch().expect("CARD_PATCH must compile on host GPU");
+        let _inflight = host
+            .make_card_inflight(1 << 20)
+            .expect("CARD_FETCH must compile on host GPU");
+
+        let size1: usize = 32 * 1024;
+        let size2: usize = 16 * 1024;
+        let dst1 = host.uav_buffer(size1 as u64).expect("dst1");
+        let dst2 = host.uav_buffer(size2 as u64).expect("dst2");
+        let (init1, init1_ptr) = host.shared_buffer(size1 as u64).expect("init1");
+        let (init2, init2_ptr) = host.shared_buffer(size2 as u64).expect("init2");
+        let (stg1, stg1_ptr) = host.shared_buffer(size1 as u64).expect("stg1");
+        let (stg2, stg2_ptr) = host.shared_buffer(size2 as u64).expect("stg2");
+        let (rb1, rb1_ptr) = host.shared_buffer(size1 as u64).expect("rb1");
+        let (rb2, rb2_ptr) = host.shared_buffer(size2 as u64).expect("rb2");
+
+        let ranges1: Vec<(usize, usize)> = vec![
+            (0, 1),
+            (2, 3),
+            (5, 6),
+            (7, 8),
+            (13, 19),
+            (100, 104),
+            (4090, 4102),
+            (8192, 8195),
+            (8197, 8201),
+            (8300, 8301),
+            (12287, 12288),
+            (16384, 26001),
+            (26002, 26003),
+        ];
+        let ranges2: Vec<(usize, usize)> = vec![(1, 4), (4095, 4097), (16380, 16384)];
+
+        // SAFETY: freshly mapped host-visible buffers of size1/size2 bytes.
+        unsafe {
+            std::slice::from_raw_parts_mut(init1_ptr, size1).fill(0xA5);
+            std::slice::from_raw_parts_mut(init2_ptr, size2).fill(0x5A);
+            for (i, b) in std::slice::from_raw_parts_mut(stg1_ptr, size1).iter_mut().enumerate() {
+                *b = ((i.wrapping_mul(37).wrapping_add(13)) & 0xFF) as u8;
+            }
+            for (i, b) in std::slice::from_raw_parts_mut(stg2_ptr, size2).iter_mut().enumerate() {
+                *b = ((i.wrapping_mul(53).wrapping_add(29)) & 0xFF) as u8;
+            }
+        }
+
+        let (copies1, blocks1) = masked_blocks(&ranges1, 1);
+        let (copies2, blocks2) = masked_blocks(&ranges2, 1);
+        assert!(!copies1.is_empty() && !blocks1.is_empty());
+        assert!(copies2.is_empty() && !blocks2.is_empty());
+
+        let total_blocks = blocks1.len() + blocks2.len();
+        let need = ((total_blocks as u64) * (512 + 8)).next_multiple_of(64 << 10);
+        let (mask_buf, mask_ptr) = host.shared_buffer(need).expect("mask_buf");
+        let mut at = 0usize;
+        let mut pack = |blocks: &[(usize, Vec<(usize, usize)>)]| -> Vec<(usize, usize)> {
+            let mut entries: Vec<[u32; 2]> = Vec::with_capacity(blocks.len());
+            for (block, br) in blocks {
+                let m = block_mask(*block, br);
+                // SAFETY: `need` covers all masks and table entries.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(m.as_ptr(), mask_ptr.add(at), 512);
+                }
+                entries.push([(*block * 4096) as u32, at as u32]);
+                at += 512;
+            }
+            let mut runs = Vec::new();
+            for pass in entries.chunks(4000) {
+                // SAFETY: `pass` fits inside `mask_buf`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        pass.as_ptr().cast::<u8>(),
+                        mask_ptr.add(at),
+                        pass.len() * 8,
+                    );
+                }
+                runs.push((at, pass.len()));
+                at += pass.len() * 8;
+            }
+            runs
+        };
+        let runs1 = pack(&blocks1);
+        let runs2 = pack(&blocks2);
+
+        let (allocator, list) = host.make_prelude().expect("prelude");
+        let exec_and_wait = || {
+            let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: valid closed command list and fence on host direct queue.
+            unsafe {
+                host.queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                *submitted += 1;
+                let target = *submitted;
+                host.queue.Signal(&host.fence, target).unwrap();
+                host.fence.SetEventOnCompletion(target, host.event).unwrap();
+                WaitForSingleObject(host.event, INFINITE);
+            }
+        };
+
+        // Step 1: initialize GPU buffers with shader-written patterns (0xA5 / 0x5A)
+        // in a separate submission so they decay back to COMMON (matching card_before).
+        // SAFETY: valid live buffers and allocator.
+        unsafe {
+            allocator.Reset().unwrap();
+            list.Reset(&allocator, None).unwrap();
+            list.CopyBufferRegion(&dst1, 0, &init1, 0, size1 as u64);
+            list.CopyBufferRegion(&dst2, 0, &init2, 0, size2 as u64);
+            list.Close().unwrap();
+        }
+        exec_and_wait();
+
+        // Step 2: run the exact Pass 1 sequence of `card_before` (copies + CARD_PATCH)
+        // followed by transitions and readback.
+        // SAFETY: valid live buffers, root signature, PSO and command list.
+        unsafe {
+            allocator.Reset().unwrap();
+            list.Reset(&allocator, None).unwrap();
+
+            // Buffer 1: CopyBufferRegion + barrier COPY_DEST->UAV + CARD_PATCH
+            for &(a, b) in &copies1 {
+                list.CopyBufferRegion(&dst1, a as u64, &stg1, a as u64, (b - a) as u64);
+            }
+            list.ResourceBarrier(&[transition(
+                &dst1,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+            list.SetComputeRootSignature(&root);
+            list.SetPipelineState(&pso);
+            list.SetComputeRootShaderResourceView(2, mask_buf.GetGPUVirtualAddress());
+            list.SetComputeRootShaderResourceView(1, stg1.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(3, dst1.GetGPUVirtualAddress());
+            for &(table_at, count) in &runs1 {
+                let constants = [table_at as u32, count as u32];
+                list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                list.Dispatch(16 * count as u32, 1, 1);
+            }
+
+            // Buffer 2: CARD_PATCH only (implicit COMMON->UAV, reusing bound PSO/t1)
+            list.SetComputeRootShaderResourceView(1, stg2.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(3, dst2.GetGPUVirtualAddress());
+            for &(table_at, count) in &runs2 {
+                let constants = [table_at as u32, count as u32];
+                list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                list.Dispatch(16 * count as u32, 1, 1);
+            }
+
+            // Transition UAV -> NON_PIXEL_SHADER_RESOURCE (as before CARD_COMPARE),
+            // then -> COPY_SOURCE for readback.
+            list.ResourceBarrier(&[
+                transition(
+                    &dst1,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                ),
+                transition(
+                    &dst2,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                ),
+            ]);
+            list.ResourceBarrier(&[
+                transition(
+                    &dst1,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                ),
+                transition(
+                    &dst2,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                ),
+            ]);
+            list.CopyBufferRegion(&rb1, 0, &dst1, 0, size1 as u64);
+            list.CopyBufferRegion(&rb2, 0, &dst2, 0, size2 as u64);
+            list.Close().unwrap();
+        }
+        exec_and_wait();
+
+        // SAFETY: GPU finished writing readback buffers.
+        unsafe {
+            assert!(
+                host.device.GetDeviceRemovedReason().is_ok(),
+                "device removed during CARD_PATCH GPU test"
+            );
+            assert_eq!(host.log_messages(), None, "D3D12 debug layer reported error");
+            let out1 = std::slice::from_raw_parts(rb1_ptr, size1);
+            let src1 = std::slice::from_raw_parts(stg1_ptr, size1);
+            for i in 0..size1 {
+                let dirty = ranges1.iter().any(|&(a, b)| i >= a && i < b);
+                let expected = if dirty { src1[i] } else { 0xA5 };
+                assert_eq!(
+                    out1[i], expected,
+                    "dst1 mismatch at byte {i} (dirty={dirty}): got {:#x}, expected {:#x}",
+                    out1[i], expected
+                );
+            }
+            let out2 = std::slice::from_raw_parts(rb2_ptr, size2);
+            let src2 = std::slice::from_raw_parts(stg2_ptr, size2);
+            for i in 0..size2 {
+                let dirty = ranges2.iter().any(|&(a, b)| i >= a && i < b);
+                let expected = if dirty { src2[i] } else { 0x5A };
+                assert_eq!(
+                    out2[i], expected,
+                    "dst2 mismatch at byte {i} (dirty={dirty}): got {:#x}, expected {:#x}",
+                    out2[i], expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn card_patch_chunked_dispatch_over_4000_blocks_on_gpu() {
+        use super::{
+            block_mask, host, masked_blocks, transition, D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, INFINITE, Interface, WaitForSingleObject,
+        };
+        let Some(host) = host() else {
+            return;
+        };
+        let (root, pso) = host.make_card_patch().expect("CARD_PATCH must compile");
+        const BLOCKS: usize = 4050;
+        let size = BLOCKS * 4096;
+        let dst = host.uav_buffer(size as u64).expect("dst");
+        let (init, init_ptr) = host.shared_buffer(size as u64).expect("init");
+        let (stg, stg_ptr) = host.shared_buffer(size as u64).expect("stg");
+        let (rb, rb_ptr) = host.shared_buffer(size as u64).expect("rb");
+
+        let ranges: Vec<(usize, usize)> = (0..BLOCKS)
+            .map(|b| {
+                let off = b * 4096 + (b % 4092);
+                (off, off + 3)
+            })
+            .collect();
+        // SAFETY: freshly mapped host-visible buffers of `size` bytes.
+        unsafe {
+            std::slice::from_raw_parts_mut(init_ptr, size).fill(0xCC);
+            let stg_slice = std::slice::from_raw_parts_mut(stg_ptr, size);
+            for (idx, &(a, b)) in ranges.iter().enumerate() {
+                for j in a..b {
+                    stg_slice[j] = ((idx.wrapping_mul(17).wrapping_add(j)) & 0xFF) as u8;
+                }
+            }
+        }
+
+        let (copies, blocks) = masked_blocks(&ranges, 1);
+        assert!(copies.is_empty());
+        assert_eq!(blocks.len(), BLOCKS);
+        let need = ((BLOCKS as u64) * (512 + 8)).next_multiple_of(64 << 10);
+        let (mask_buf, mask_ptr) = host.shared_buffer(need).expect("mask_buf");
+        let mut at = 0usize;
+        let mut entries: Vec<[u32; 2]> = Vec::with_capacity(BLOCKS);
+        for (block, br) in &blocks {
+            let m = block_mask(*block, br);
+            // SAFETY: fits within `need`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(m.as_ptr(), mask_ptr.add(at), 512);
+            }
+            entries.push([(*block * 4096) as u32, at as u32]);
+            at += 512;
+        }
+        let mut runs = Vec::new();
+        for pass in entries.chunks(4000) {
+            // SAFETY: fits within `need`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    pass.as_ptr().cast::<u8>(),
+                    mask_ptr.add(at),
+                    pass.len() * 8,
+                );
+            }
+            runs.push((at, pass.len()));
+            at += pass.len() * 8;
+        }
+        assert_eq!(runs.len(), 2, "4050 blocks must split into 4000 + 50 passes");
+        assert!(at as u64 <= need);
+
+        let (allocator, list) = host.make_prelude().expect("prelude");
+        let exec_and_wait = || {
+            let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: valid closed command list and fence.
+            unsafe {
+                host.queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                *submitted += 1;
+                let target = *submitted;
+                host.queue.Signal(&host.fence, target).unwrap();
+                host.fence.SetEventOnCompletion(target, host.event).unwrap();
+                WaitForSingleObject(host.event, INFINITE);
+            }
+        };
+
+        // SAFETY: valid live buffers.
+        unsafe {
+            allocator.Reset().unwrap();
+            list.Reset(&allocator, None).unwrap();
+            list.CopyBufferRegion(&dst, 0, &init, 0, size as u64);
+            list.Close().unwrap();
+        }
+        exec_and_wait();
+
+        // SAFETY: valid live buffers, root signature and PSO.
+        unsafe {
+            allocator.Reset().unwrap();
+            list.Reset(&allocator, None).unwrap();
+            list.SetComputeRootSignature(&root);
+            list.SetPipelineState(&pso);
+            list.SetComputeRootShaderResourceView(2, mask_buf.GetGPUVirtualAddress());
+            list.SetComputeRootShaderResourceView(1, stg.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(3, dst.GetGPUVirtualAddress());
+            for &(table_at, count) in &runs {
+                let constants = [table_at as u32, count as u32];
+                list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                list.Dispatch(16 * count as u32, 1, 1);
+            }
+            list.ResourceBarrier(&[transition(
+                &dst,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.CopyBufferRegion(&rb, 0, &dst, 0, size as u64);
+            list.Close().unwrap();
+        }
+        exec_and_wait();
+
+        // SAFETY: GPU finished readback.
+        unsafe {
+            assert!(host.device.GetDeviceRemovedReason().is_ok());
+            assert_eq!(host.log_messages(), None, "D3D12 debug layer reported error");
+            let out = std::slice::from_raw_parts(rb_ptr, size);
+            let src = std::slice::from_raw_parts(stg_ptr, size);
+            for b in [0usize, 1, 1234, 3999, 4000, 4049] {
+                let (a, end) = ranges[b];
+                for j in a..end {
+                    assert_eq!(out[j], src[j], "block {b} dirty byte {j} mismatch");
+                }
+                if a > b * 4096 {
+                    assert_eq!(out[a - 1], 0xCC, "block {b} byte before dirty range clobbered");
+                }
+                if end < (b + 1) * 4096 {
+                    assert_eq!(out[end], 0xCC, "block {b} byte after dirty range clobbered");
+                }
+            }
+        }
+    }
 }
