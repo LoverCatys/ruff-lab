@@ -134,7 +134,7 @@ fn slow(p: &Pending) -> bool {
 /// the hundred then, and a pass the title runs once is lost if its
 /// pipeline is not there. All such waits of a run together are bounded;
 /// the title's GPU watchdog bounds one frame's (30 s).
-const LOADING_FRAME: Duration = Duration::from_secs(4);
+const LOADING_FRAME: Duration = Duration::from_secs(10);
 /// The same for compute pipelines, waited for apart: the passes that unpack
 /// a world's models are dispatched once, and in a run whose pipelines were
 /// all still to be loaded 130 of them were dropped, and with them walls,
@@ -148,18 +148,47 @@ fn loading_left(spent: Duration) -> Duration {
         let seconds = std::env::var("VICTORY_PIPELINE_GATE_S")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(120);
+            .unwrap_or(180);
         Duration::from_secs(seconds)
     });
     total.saturating_sub(spent)
 }
 
-/// Pipelines queued and not made yet.
+/// Pipelines queued and not made yet (all kinds, and graphics-only).
 static WAITING: AtomicU64 = AtomicU64::new(0);
+static WAITING_GFX: AtomicU64 = AtomicU64::new(0);
 
 /// Pipelines queued and not made yet (for the frame line).
 pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
+}
+
+/// Graphics pipelines queued or compiling right now.
+pub(crate) fn waiting_gfx() -> u64 {
+    WAITING_GFX.load(Ordering::Relaxed)
+}
+
+/// Waits up to `max_wait` for queued/in-progress graphics pipelines to finish
+/// compiling before the first world frame draws, returning `(remaining_gfx, elapsed)`.
+pub(crate) fn wait_for_graphics_preload(max_wait: Duration) -> (u64, Duration) {
+    let started = Instant::now();
+    if max_wait.is_zero() || WAITING_GFX.load(Ordering::Relaxed) == 0 {
+        return (WAITING_GFX.load(Ordering::Relaxed), Duration::ZERO);
+    }
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while WAITING_GFX.load(Ordering::Relaxed) > 0 {
+        let rest = max_wait.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        held = done
+            .wait_timeout(held, rest.min(Duration::from_millis(100)))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+    drop(held);
+    (WAITING_GFX.load(Ordering::Relaxed), started.elapsed())
 }
 
 /// The host pipeline if it is made (or is made within the frame's budget);
@@ -239,6 +268,10 @@ fn wait(p: &Pending, frame: u64) {
         return;
     }
     let started = Instant::now();
+    // Freeze the title's clock during long loading-gate waits so prologue
+    // cutscenes never skip ahead while newly-encountered pipelines compile.
+    let _freeze = (budget > wait_budget() && crate::preload::enabled())
+        .then(crate::preload::freeze_clock);
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() && !slow(p) {
@@ -381,6 +414,9 @@ fn start(p: &Arc<Pending>, priority: u8) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if new {
+            if p.graphics.is_some() {
+                WAITING_GFX.fetch_add(1, Ordering::Relaxed);
+            }
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
         AVAILABLE.notify_one();
@@ -434,6 +470,9 @@ fn workers() -> bool {
                         let (p, compute) = next();
                         let _slot = ComputeSlot(compute);
                         p.make();
+                        if !compute {
+                            WAITING_GFX.fetch_sub(1, Ordering::Relaxed);
+                        }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {

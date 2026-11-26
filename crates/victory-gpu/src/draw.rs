@@ -1686,7 +1686,7 @@ impl State {
             shadow.refresh(list, *from, to - from);
         }
         let textures_began = std::time::Instant::now();
-        self.heap_textures(list, heap, host);
+        self.preload_or_heap_textures(list, heap, host);
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1731,11 +1731,19 @@ impl State {
             BAKED_MS.store(0, Ordering::Relaxed);
         }
         let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
+        let loading_screen = !crate::preload::world_entered() && crate::preload::enabled();
+        let early_user_set = std::env::var_os("VICTORY_EARLY_TEXTURES_MS").is_some();
         let budget = if bake && left > 0 {
             // What a bake may read must be there now: up to 2 GiB.
             (left, 2 << 30)
         } else if first && early_ms > 0 {
-            (early_ms, 64 << 20)
+            // During the loading screen, drain freshly-streamed textures aggressively
+            // so the prologue starts with textures already resident on the GPU.
+            if loading_screen && !early_user_set {
+                (120, 512 << 20)
+            } else {
+                (early_ms, 64 << 20)
+            }
         } else {
             return;
         };
@@ -1765,12 +1773,149 @@ impl State {
             );
         }
         let began = std::time::Instant::now();
-        PASS_BUDGET.set(Some(budget));
-        self.heap_textures(list, heap, host);
-        PASS_BUDGET.set(None);
+        if loading_screen && !bake {
+            let limit = std::time::Duration::from_millis(budget.0);
+            while began.elapsed() < limit {
+                let left_ms = budget.0.saturating_sub(began.elapsed().as_millis() as u64);
+                if left_ms == 0 {
+                    break;
+                }
+                let before = HEAP_TEXTURES.load(Ordering::Relaxed);
+                PASS_BUDGET.set(Some((left_ms, budget.1)));
+                self.heap_textures(list, heap, host);
+                PASS_BUDGET.set(None);
+                let due_left = host.texture_slots_due(frame, 1).1[1];
+                if HEAP_TEXTURES.load(Ordering::Relaxed) == before || due_left == 0 {
+                    break;
+                }
+            }
+        } else {
+            PASS_BUDGET.set(Some(budget));
+            self.heap_textures(list, heap, host);
+            PASS_BUDGET.set(None);
+        }
         if bake {
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
+    }
+
+    /// Runs `heap_textures` normally, or performs a full preload gate on the
+    /// first world frame (and on major scene-streaming bursts `due >= 256`) so
+    /// prologue textures and graphics pipelines finish loading before the scene
+    /// renders and title clocks advance.
+    fn preload_or_heap_textures(
+        &self,
+        list: &HostList,
+        heap: &crate::descriptor::Heap,
+        host: &crate::descriptor::host::HostHeap,
+    ) {
+        let first_world = crate::preload::mark_world_entered();
+        if !crate::preload::enabled() {
+            self.heap_textures(list, heap, host);
+            return;
+        }
+        let frame = crate::frame::current();
+        host.texture_slots_remapped(frame);
+        let due_now = host.texture_slots_due(frame, 1).1[1];
+        let burst = !first_world && due_now >= 256;
+        if !first_world && !burst {
+            self.heap_textures(list, heap, host);
+            return;
+        }
+        let timeout = if first_world {
+            crate::preload::world_timeout()
+        } else {
+            crate::preload::scene_timeout()
+        };
+        if timeout.is_zero() {
+            self.heap_textures(list, heap, host);
+            return;
+        }
+        let _freeze = crate::preload::freeze_clock();
+        let started = std::time::Instant::now();
+        let uploaded_start = HEAP_TEXTURES.load(Ordering::Relaxed);
+        let bytes_start = HEAP_TEXTURE_BYTES.load(Ordering::Relaxed);
+
+        // Reclaim stale loading-screen textures before filling VRAM with scene textures.
+        crate::resource::let_go_idle();
+
+        // On the very first world frame, let queued graphics PSOs finish compiling
+        // so opening cutscene geometry is not dropped while the clock stays paused.
+        let mut gfx_waited_ms = 0u64;
+        let mut gfx_left = 0u64;
+        if first_world {
+            let pso_budget = timeout.min(std::time::Duration::from_secs(10));
+            let (left, elapsed) = crate::pipeline::wait_for_graphics_preload(pso_budget);
+            gfx_left = left;
+            gfx_waited_ms = elapsed.as_millis() as u64;
+        }
+
+        let mut passes = 0u32;
+        let mut stale_since: Option<std::time::Instant> = None;
+        while started.elapsed() < timeout {
+            if crate::descriptor::host::device_removed().is_some() {
+                break;
+            }
+            let left_ms = timeout
+                .saturating_sub(started.elapsed())
+                .as_millis()
+                .max(1) as u64;
+            let before = HEAP_TEXTURES.load(Ordering::Relaxed);
+            PASS_BUDGET.set(Some((left_ms, 4 << 30)));
+            self.heap_textures(list, heap, host);
+            PASS_BUDGET.set(None);
+            passes += 1;
+
+            let uploaded = HEAP_TEXTURES.load(Ordering::Relaxed).saturating_sub(before);
+            let due_left = host.texture_slots_due(frame, 1).1[1];
+            let io = crate::preload::io_pending();
+
+            if uploaded > 0 {
+                stale_since = None;
+                if due_left == 0 && (!first_world || io == 0) {
+                    break;
+                }
+                continue;
+            }
+            // No textures uploaded in this pass: if DirectStorage is still actively
+            // reading prologue assets on the first world frame, give it short slices
+            // to map new pages and re-check.
+            if first_world && io > 0 && started.elapsed() < timeout {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                host.texture_slots_remapped(frame);
+                continue;
+            }
+            if due_left == 0 {
+                break;
+            }
+            let since = *stale_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= std::time::Duration::from_millis(150) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            host.texture_slots_remapped(frame);
+        }
+
+        let uploaded_total = HEAP_TEXTURES.load(Ordering::Relaxed).saturating_sub(uploaded_start);
+        let mb_total = HEAP_TEXTURE_BYTES
+            .load(Ordering::Relaxed)
+            .saturating_sub(bytes_start)
+            >> 20;
+        let due_left = host.texture_slots_due(frame, 1).1[1];
+        tracing::info!(
+            kind = if first_world { "world_start" } else { "scene_burst" },
+            frame,
+            passes,
+            uploaded = uploaded_total,
+            mb = mb_total,
+            due_initial = due_now,
+            due_left,
+            io_pending = crate::preload::io_pending(),
+            gfx_waited_ms,
+            gfx_left,
+            total_ms = started.elapsed().as_millis() as u64,
+            "scene preload gate finished"
+        );
     }
 
     /// The queue's side of the card accounting line

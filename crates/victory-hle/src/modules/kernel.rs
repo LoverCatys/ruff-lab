@@ -350,6 +350,24 @@ fn refuse(file: &str) {
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 
+/// Adjusted performance counter: pauses during GPU texture/PSO preload gates
+/// so opening cutscenes and watchdogs do not jump across a preload stall.
+pub extern "system" fn QueryPerformanceCounter(out: *mut i64) -> i32 {
+    let mut raw = 0i64;
+    let ok = host::query_performance_counter(&mut raw);
+    if ok != 0 && !out.is_null() {
+        // SAFETY: the title passes a writable LARGE_INTEGER out pointer.
+        unsafe { out.write(victory_gpu::preload::adjusted_qpc(raw)) };
+    }
+    ok
+}
+
+/// Adjusted 64-bit millisecond tick counter: stays paused in sync with
+/// [`QueryPerformanceCounter`] during preload gates.
+pub extern "system" fn GetTickCount64() -> u64 {
+    victory_gpu::preload::adjusted_tick64(host::get_tick_count64())
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -360,6 +378,8 @@ pub(crate) fn module() -> HleModule {
             "api-ms-win-core-processthreads-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
+            "api-ms-win-core-profile-*",
+            "api-ms-win-core-sysinfo-*",
             "api-ms-win-crt-runtime-*",
         ],
         exports: vec![
@@ -382,6 +402,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(QueryPerformanceCounter),
+            hle_export!(GetTickCount64),
         ],
     }
 }
@@ -402,6 +424,8 @@ mod host {
         DisableThreadLibraryCalls, GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleA,
         GetModuleHandleW, GetProcAddress, LoadLibraryExA, LoadLibraryExW,
     };
+    use windows_sys::Win32::System::Performance::QueryPerformanceCounter;
+    use windows_sys::Win32::System::SystemInformation::GetTickCount64;
     use windows_sys::Win32::System::Threading::TerminateProcess;
 
     unsafe extern "C" {
@@ -484,6 +508,16 @@ mod host {
     pub(super) fn terminate_process(process: *mut c_void, code: u32) -> i32 {
         // SAFETY: see above.
         unsafe { TerminateProcess(process, code) }
+    }
+
+    pub(super) fn query_performance_counter(out: *mut i64) -> i32 {
+        // SAFETY: plain OS query into caller's local.
+        unsafe { QueryPerformanceCounter(out) }
+    }
+
+    pub(super) fn get_tick_count64() -> u64 {
+        // SAFETY: plain OS query.
+        unsafe { GetTickCount64() }
     }
 
     pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {
@@ -579,6 +613,18 @@ mod host {
 
     pub(super) fn terminate_process(_: *mut c_void, code: u32) -> i32 {
         std::process::exit(code as i32)
+    }
+
+    pub(super) fn query_performance_counter(out: *mut i64) -> i32 {
+        if !out.is_null() {
+            // SAFETY: caller's local.
+            unsafe { out.write(0) };
+        }
+        1
+    }
+
+    pub(super) fn get_tick_count64() -> u64 {
+        0
     }
 
     pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
@@ -683,5 +729,29 @@ mod tests {
         let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
         assert!(!runtime.is_null());
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preload_freeze_pauses_title_qpc_and_tick64() {
+        let mut t0 = 0i64;
+        assert_ne!(QueryPerformanceCounter(&mut t0), 0);
+        let tick0 = GetTickCount64();
+        {
+            let _guard = victory_gpu::preload::freeze_clock();
+            let mut frozen_a = 0i64;
+            assert_ne!(QueryPerformanceCounter(&mut frozen_a), 0);
+            let tick_a = GetTickCount64();
+            std::thread::sleep(std::time::Duration::from_millis(35));
+            let mut frozen_b = 0i64;
+            assert_ne!(QueryPerformanceCounter(&mut frozen_b), 0);
+            let tick_b = GetTickCount64();
+            assert_eq!(frozen_a, frozen_b, "QPC must stay frozen during preload");
+            assert_eq!(tick_a, tick_b, "GetTickCount64 must stay frozen during preload");
+        }
+        let mut after = 0i64;
+        assert_ne!(QueryPerformanceCounter(&mut after), 0);
+        assert!(after >= t0, "QPC must remain monotonic after resume");
+        assert!(GetTickCount64() >= tick0, "GetTickCount64 must remain monotonic");
     }
 }

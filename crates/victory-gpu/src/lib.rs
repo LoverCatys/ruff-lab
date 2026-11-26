@@ -44,6 +44,7 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod plaincopy;
+pub mod preload;
 #[cfg(windows)]
 mod primitive;
 pub mod query;

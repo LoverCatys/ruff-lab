@@ -396,6 +396,9 @@ struct Job {
 // SAFETY: as for `Lane`.
 unsafe impl Send for Job {}
 
+/// Active submitted/running DirectStorage read requests (for `victory_gpu::preload`).
+static ACTIVE_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// The scheduler, with its workers started on first use; `None` if not
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
@@ -425,6 +428,9 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
+        victory_gpu::preload::register_io_pending(|| {
+            ACTIVE_READS.load(std::sync::atomic::Ordering::Relaxed)
+        });
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
         let workers = dstorage_workers(std::env::var("VICTORY_DSTORAGE_WORKERS").ok().as_deref(), cpus);
         let started = (0..workers)
@@ -594,6 +600,7 @@ impl Lanes {
 
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
         self.staged -= job.staging;
+        ACTIVE_READS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(lane) = self.lanes.get_mut(&job.lane) {
             lane.running.remove(&job.seq);
             if let Err(hr) = result {
@@ -631,6 +638,7 @@ impl Lanes {
                     if pages.is_none() && page_list() == PageList::Submit {
                         pages = resolve(&request, "submit");
                     }
+                    ACTIVE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     lane.reads.push_back((seq, request, pages));
                 }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
