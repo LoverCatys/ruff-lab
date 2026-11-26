@@ -831,6 +831,9 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Bumped whenever `states` changes (or resets / twin routes move), so
+    /// `State::prepare_for` can skip redundant `ensure_state` checks (PR #3249).
+    states_generation: std::sync::atomic::AtomicU64,
     /// The states of the host copies of title memory the list uses.
     buffers: Mutex<BufferStates<ID3D12Resource>>,
     /// What the list does with depth textures that have a colour twin, by
@@ -3601,6 +3604,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                states_generation: std::sync::atomic::AtomicU64::new(0),
                 buffers: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
@@ -5677,6 +5681,7 @@ impl HostList {
         self._alive.used();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.states_generation.fetch_add(1, Ordering::Release);
         self.buffers.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -5708,6 +5713,12 @@ impl HostList {
     /// list: the host texture and the state it leaves, if that is a change.
     /// The list's first use of a texture records nothing: its prelude brings
     /// the texture there at submission.
+    /// Generation counter for `self.states`, bumped only on actual state
+    /// transitions or resets (PR #3249 + `d4903fa`).
+    pub(crate) fn states_generation(&self) -> u64 {
+        self.states_generation.load(Ordering::Acquire)
+    }
+
     pub(crate) fn transition(
         &self,
         resource: crate::object::This,
@@ -5720,11 +5731,17 @@ impl HostList {
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert((wanted, wanted, copy));
+                self.states_generation.fetch_add(1, Ordering::Release);
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
+                if before != wanted {
+                    self.states_generation.fetch_add(1, Ordering::Release);
+                    Some((texture, before))
+                } else {
+                    None
+                }
             }
         }
     }
@@ -5739,11 +5756,17 @@ impl HostList {
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert((wanted, wanted, copy.clone()));
+                self.states_generation.fetch_add(1, Ordering::Release);
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some(before)
+                if before != wanted {
+                    self.states_generation.fetch_add(1, Ordering::Release);
+                    Some(before)
+                } else {
+                    None
+                }
             }
         };
         drop(states);
@@ -5770,11 +5793,17 @@ impl HostList {
         match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert((wanted, wanted, copy.clone()));
+                self.states_generation.fetch_add(1, Ordering::Release);
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some(before)
+                if before != wanted {
+                    self.states_generation.fetch_add(1, Ordering::Release);
+                    Some(before)
+                } else {
+                    None
+                }
             }
         }
     }

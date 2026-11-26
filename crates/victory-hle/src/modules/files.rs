@@ -253,6 +253,23 @@ type File = *mut c_void;
 
 // kernel32 and its file API sets.
 
+/// Strips `FILE_FLAG_NO_BUFFERING` on synchronous read-only handles (PR #2427)
+/// so pack reads populate the Windows OS file cache and read-ahead on HDDs
+/// while keeping `FILE_FLAG_NO_BUFFERING` for overlapped/writable handles
+/// (`VICTORY_PACK_CACHE=0` disables).
+fn dropped_flags(access: u32, flags: u32) -> u32 {
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ON.get_or_init(|| std::env::var_os("VICTORY_PACK_CACHE").is_none_or(|v| v != "0"));
+    if enabled && access == GENERIC_READ && (flags & FILE_FLAG_OVERLAPPED) == 0 {
+        FILE_FLAG_NO_BUFFERING
+    } else {
+        0
+    }
+}
+
 pub extern "system" fn CreateFileW(
     path: *const u16,
     access: u32,
@@ -263,6 +280,7 @@ pub extern "system" fn CreateFileW(
     template: Handle,
 ) -> Handle {
     let p = wide(path);
+    let flags = flags & !dropped_flags(access, flags);
     host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
         access,
@@ -283,6 +301,7 @@ pub extern "system" fn CreateFileA(
     flags: u32,
     template: Handle,
 ) -> Handle {
+    let flags = flags & !dropped_flags(access, flags);
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(

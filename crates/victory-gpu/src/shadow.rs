@@ -44,6 +44,9 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Lock-free count of `pending`, updated strictly inside `pending`'s lock
+    /// so `update` and `writes_pending` skip locking when empty (PR #2848).
+    pending_len: std::sync::atomic::AtomicUsize,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -2399,6 +2402,7 @@ impl Shadow {
             ranged: Mutex::new([(0, 0, 0); 2]),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            pending_len: std::sync::atomic::AtomicUsize::new(0),
             flights: Mutex::default(),
             before: Mutex::default(),
             kept: Mutex::default(),
@@ -2472,16 +2476,28 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.pending_len.store(pending.len(), Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
+        let (init_from, init_to) = self.inside(address, len);
+        let mut parts = Vec::with_capacity(4);
+        if init_from < init_to {
+            parts.push((init_from, init_to));
+        }
+        let mut rest = Vec::with_capacity(4);
         for &(a, e) in pending.iter() {
+            if parts.is_empty() {
+                break;
+            }
             let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
+            if a >= e {
+                continue;
+            }
+            rest.clear();
+            for &(from, to) in &parts {
                 if e <= from || a >= to {
                     rest.push((from, to));
                     continue;
@@ -2493,9 +2509,13 @@ impl Shadow {
                     rest.push((e, to));
                 }
             }
-            parts = rest;
+            std::mem::swap(&mut parts, &mut rest);
         }
         pending.push(range);
+        self.pending_len.store(pending.len(), Ordering::Release);
+        if parts.is_empty() {
+            return;
+        }
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -2606,29 +2626,49 @@ impl Shadow {
             for &(at, n) in &differing {
                 self.changed(at, at + n);
             }
-            // Sized to each stretch read (`back_piece`): a zeroed 64 KiB per
-            // range, most of whose ranges differ nowhere, was most of the
-            // work for small ranges.
-            let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
-            for (at, n) in differing {
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
-                let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
-                    continue;
-                };
-                let at = at + first;
-                crate::watch::writing(start + at, n);
-                // Only the GPU's bytes (upstream #2009): the rest of the
-                // stretch is the title's as read, and a title write landing
-                // there since stays.
-                for &(off, len) in &runs {
-                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
-                    written += len;
-                }
+            // Reuse per-thread scratch buffers across ranges to avoid thousands
+            // of page faults per frame on 16 GiB systems (PR #2848 / #3318).
+            thread_local! {
+                static BACK_SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<u8>, Vec<(usize, usize)>)> =
+                    const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
             }
+            BACK_SCRATCH.with(|cell| {
+                let mut scratch = cell.borrow_mut();
+                let (title, mask, runs) = &mut *scratch;
+                for (at, n) in differing {
+                    // SAFETY: inside the mapping; only the submitting thread
+                    // writes it.
+                    let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    let old = &before[at - from..at - from + n];
+                    let read = |first: usize, title: &mut [u8]| {
+                        crate::host::read_into((start + at + first) as *const u8, title)
+                    };
+                    let Some((first, n)) = back_piece(host, old, title, mask, runs, read) else {
+                        continue;
+                    };
+                    let at = at + first;
+                    crate::watch::writing(start + at, n);
+                    // Only the GPU's bytes (upstream #2009): the rest of the
+                    // stretch is the title's as read, and a title write landing
+                    // there since stays.
+                    for &(off, len) in runs.iter() {
+                        crate::host::write_mapped(
+                            (start + at + off) as *mut u8,
+                            title[off..].as_ptr(),
+                            len,
+                        );
+                        written += len;
+                    }
+                }
+                if title.capacity() > 256 << 10 {
+                    title.clear();
+                    title.shrink_to(64 << 10);
+                }
+                if mask.capacity() > 256 << 10 {
+                    mask.clear();
+                    mask.shrink_to(64 << 10);
+                }
+            });
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
             // frame). Asking about the whole range here, to note them
@@ -2793,6 +2833,7 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        self.pending_len.store(pending.len(), Ordering::Release);
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -2850,7 +2891,7 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.pending_len.load(Ordering::Acquire) > 0
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
@@ -3032,6 +3073,9 @@ impl Shadow {
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
             return 0;
+        }
+        if self.pending_len.load(Ordering::Acquire) == 0 {
+            return self.update_free(from, to);
         }
         let mut busy: Vec<(usize, usize)> = self
             .pending

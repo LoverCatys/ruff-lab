@@ -311,6 +311,10 @@ pub(crate) struct State {
     targets_set: bool,
     /// Cached render targets + depth bound on the host list (`VICTORY_BIND_CACHE`).
     host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
+    /// Memoized `(targets, depth, effective_depth_state, states_generation)` so
+    /// consecutive draws with unchanged targets skip redundant `ensure_state`
+    /// locks (PR #3249 + `d4903fa`).
+    ensured: Option<(Vec<usize>, usize, u32, u64)>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -609,6 +613,7 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
         self.host_targets = None;
+        self.ensured = None;
     }
 
     pub(crate) fn reset(&mut self, pipeline: This) {
@@ -843,6 +848,7 @@ impl State {
             self.set_topology(list, self.topology);
         }
         self.host_targets = None;
+        self.ensured = None;
         if self.targets_set {
             let handles = std::mem::take(&mut self.target_handles);
             self.set_targets(list, &handles, self.depth_handle);
@@ -1094,18 +1100,14 @@ impl State {
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
         const RENDER_TARGET: u32 = 0x4;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
-        }
         if self.depth != 0 {
             // A depth texture shaders also write: what they wrote, first.
+            // Kept outside the `ensured` cache so a colour-twin UAV write in
+            // `bind()` is always synced before depth testing/writing.
             list.twin_use(self.depth as This, false, true);
-            // A view that writes neither plane keeps the texture readable:
-            // the depth read state, together with the shader read states
-            // if this draw's shaders read the same texture (the write state
-            // put it out of the state those views need, and a move to it
-            // and back for every such draw).
-            let state = if self.depth_state == DEPTH_READ {
+        }
+        let depth_wanted = if self.depth != 0 {
+            if self.depth_state == DEPTH_READ {
                 let (tested, read) = TESTED_DEPTH.get();
                 if read && tested == self.depth {
                     DEPTH_READ | SHADER_RESOURCE
@@ -1114,8 +1116,36 @@ impl State {
                 }
             } else {
                 DEPTH_WRITE
-            };
-            crate::list::ensure_state(list, self.depth as This, state);
+            }
+        } else {
+            0
+        };
+        let gen_before = list.states_generation();
+        let already_ensured = self.ensured.as_ref().is_some_and(|(t, d, ds, g)| {
+            *g == gen_before && *d == self.depth && *ds == depth_wanted && *t == self.targets
+        });
+        if !already_ensured {
+            for &t in &self.targets {
+                crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            }
+            if self.depth != 0 {
+                crate::list::ensure_state(list, self.depth as This, depth_wanted);
+            }
+            // Capture generation AFTER the loop so transitions emitted above do
+            // not immediately invalidate the cache (PR #3249 `d4903fa`).
+            let gen_after = list.states_generation();
+            match &mut self.ensured {
+                Some((t, d, ds, g)) => {
+                    t.clear();
+                    t.extend_from_slice(&self.targets);
+                    *d = self.depth;
+                    *ds = depth_wanted;
+                    *g = gen_after;
+                }
+                None => {
+                    self.ensured = Some((self.targets.clone(), self.depth, depth_wanted, gen_after));
+                }
+            }
         }
         true
     }
@@ -1204,7 +1234,16 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                const INLINE: usize = 64;
+                let n = dwords as usize;
+                let mut stack = [0u32; INLINE];
+                let mut overflow: Vec<u32> = Vec::new();
+                let values: &mut [u32] = if n <= INLINE {
+                    &mut stack[..n]
+                } else {
+                    overflow.resize(n, 0);
+                    &mut overflow[..n]
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -1629,39 +1668,105 @@ impl State {
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
-        for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
-            let Some(handle) = heap.handle(index) else {
-                continue;
-            };
-            let Some(view) = host.mirror(index, handle, true) else {
-                continue;
-            };
-            // Every 64 views while the device lives (a cheap query).
-            if alive
-                && n % 64 == 63
-                && let Some(why) = crate::descriptor::host::device_removed()
-            {
-                alive = false;
-                GONE.store(true, Ordering::Relaxed);
-                let last: Vec<String> = slots[n - 63..=n]
-                    .iter()
-                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
-                    .map(|s| s.chars().take(200).collect())
+        if slots.len() >= 128 {
+            // Pre-resolve `(index, handle)` on the calling thread so worker
+            // threads only share `Sync` `&HostHeap` (`Heap` itself is `!Sync`).
+            let mut work: Vec<(u32, u64)> = Vec::with_capacity(slots.len());
+            for &index in &slots {
+                match heap.handle(index) {
+                    Some(handle) => work.push((index, handle)),
+                    None => {
+                        ranges.remove(&index);
+                    }
+                }
+            }
+            // `HostHeap::mirror` uses striped slot locks and `buffer_copy` is
+            // read-only, so large batches (up to 35k slots/frame) mirror in
+            // parallel across worker threads.
+            let threads = std::thread::available_parallelism()
+                .map_or(4, |n| (n.get() / 2).clamp(2, 6))
+                .min((work.len() / 64).max(1))
+                .max(1);
+            let chunk_len = work.len().div_ceil(threads).max(1);
+            type SlotEntry = (u32, Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>);
+            let chunks: Vec<Vec<SlotEntry>> = std::thread::scope(|s| {
+                let handles: Vec<_> = work
+                    .chunks(chunk_len)
+                    .map(|chunk| {
+                        s.spawn(move || {
+                            let mut out = Vec::with_capacity(chunk.len());
+                            for &(index, handle) in chunk {
+                                let entry = host
+                                    .mirror(index, handle, true)
+                                    .and_then(|view| {
+                                        let (shadow, address, len) =
+                                            crate::descriptor::host::buffer_copy(&view)?;
+                                        #[cfg(feature = "diagnostics")]
+                                        if host.shows(index, &shadow.buffer) == Some(false) {
+                                            HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        Some((shadow, address, address + len))
+                                    });
+                                out.push((index, entry));
+                            }
+                            out
+                        })
+                    })
                     .collect();
-                tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
+                handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+            });
+            for chunk in chunks {
+                for (index, entry) in chunk {
+                    match entry {
+                        Some(val) => {
+                            ranges.insert(index, val);
+                        }
+                        None => {
+                            ranges.remove(&index);
+                        }
+                    }
+                }
+            }
+            if alive && let Some(why) = crate::descriptor::host::device_removed() {
+                GONE.store(true, Ordering::Relaxed);
+                tracing::error!(why, slots = slots.len(), "the host device went while buffer views of the heap were made");
                 crate::host::log_removal_context();
             }
-            // The copy the slot shows (`buffer_copy`), not the one the
-            // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
-                continue;
-            };
-            #[cfg(feature = "diagnostics")]
-            if host.shows(index, &shadow.buffer) == Some(false) {
-                HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+        } else {
+            for (n, &index) in slots.iter().enumerate() {
+                ranges.remove(&index);
+                let Some(handle) = heap.handle(index) else {
+                    continue;
+                };
+                let Some(view) = host.mirror(index, handle, true) else {
+                    continue;
+                };
+                // Every 64 views while the device lives (a cheap query).
+                if alive
+                    && n % 64 == 63
+                    && let Some(why) = crate::descriptor::host::device_removed()
+                {
+                    alive = false;
+                    GONE.store(true, Ordering::Relaxed);
+                    let last: Vec<String> = slots[n - 63..=n]
+                        .iter()
+                        .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                        .map(|s| s.chars().take(200).collect())
+                        .collect();
+                    tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
+                    crate::host::log_removal_context();
+                }
+                // The copy the slot shows (`buffer_copy`), not the one the
+                // view's range alone would find.
+                let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                    continue;
+                };
+                #[cfg(feature = "diagnostics")]
+                if host.shows(index, &shadow.buffer) == Some(false) {
+                    HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                }
+                ranges.insert(index, (shadow, address, address + len));
             }
-            ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.

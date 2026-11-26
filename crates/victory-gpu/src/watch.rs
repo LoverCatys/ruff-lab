@@ -850,6 +850,8 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 }
 
 /// [`open`] for one range, without the other views of its pages.
+/// Coalesces contiguous guarded blocks into a single `VirtualProtect` call
+/// (PR #2848) and falls back per-block if a run spans distinct allocations.
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
@@ -857,14 +859,43 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
+    if blocks.is_empty() {
+        return false;
+    }
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
-    !blocks.is_empty()
+    let mut i = 0;
+    while i < blocks.len() {
+        let run_start = blocks[i];
+        let mut run_end = run_start + 1;
+        while i + 1 < blocks.len() && blocks[i + 1] == run_end {
+            i += 1;
+            run_end += 1;
+        }
+        let mut old = 0;
+        // SAFETY: guarded blocks we previously made read-only.
+        let whole = unsafe {
+            VirtualProtect(
+                (run_start * BLOCK) as *const _,
+                (run_end - run_start) * BLOCK,
+                PAGE_READWRITE,
+                &mut old,
+            )
+        };
+        if whole == 0 {
+            // Spans separate VirtualAlloc regions (ERROR_INVALID_ADDRESS 487):
+            // fall back to opening each block individually.
+            for block in run_start..run_end {
+                let mut old = 0;
+                // SAFETY: a block we made read-only.
+                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+            }
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Before our own write into title memory `[at, at + len)` through the

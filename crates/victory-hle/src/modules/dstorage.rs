@@ -114,14 +114,25 @@ fn from_win32(error: &std::io::Error) -> HRESULT {
 
 type Factory = *const Object;
 
+/// Whether DirectStorage opens files with `FILE_FLAG_OVERLAPPED` so worker
+/// threads issue concurrent offset reads instead of serializing on a
+/// synchronous handle (`VICTORY_DSTORAGE_OVERLAPPED=0` disables; PR #2427).
+fn overlapped_reads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_OVERLAPPED").is_none_or(|v| v != "0"))
+}
+
 /// Opens `path` for reading; the file object owns the handle.
 extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
     if path.is_null() {
         return E_INVALIDARG;
     }
+    let overlapped = overlapped_reads();
+    let flags = if overlapped { FILE_FLAG_OVERLAPPED } else { 0 };
     // Goes through `files`, so paths on our virtual drives work too.
     let handle = super::files::CreateFileW(
         path,
@@ -129,7 +140,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         FILE_SHARE_READ,
         std::ptr::null(),
         OPEN_EXISTING,
-        0,
+        flags,
         std::ptr::null_mut(),
     );
     // SAFETY: the title passes a NUL-terminated path.
@@ -143,10 +154,13 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         return from_win32(&error);
     }
     let kept = name.clone();
-    tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
+    tracing::info!(path = name, iid = iid_text(iid), overlapped, "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(
+        Object::new("dstorage file", &FILE_VTABLE),
+        File { file, overlapped },
+    );
     WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
@@ -261,6 +275,7 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    overlapped: bool,
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -1126,6 +1141,40 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
+/// Per-worker manual-reset event for overlapped DirectStorage reads.
+struct ReadEvent(*mut c_void);
+
+impl ReadEvent {
+    fn get() -> Result<*mut c_void, HRESULT> {
+        use windows_sys::Win32::System::Threading::CreateEventW;
+        thread_local! {
+            static EVENT: std::cell::RefCell<Option<ReadEvent>> = const { std::cell::RefCell::new(None) };
+        }
+        EVENT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if let Some(ev) = slot.as_ref() {
+                return Ok(ev.0);
+            }
+            // SAFETY: creates an unnamed manual-reset unsignalled event owned by this thread.
+            let h = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            if h.is_null() {
+                return Err(from_win32(&std::io::Error::last_os_error()));
+            }
+            *slot = Some(ReadEvent(h));
+            Ok(h)
+        })
+    }
+}
+
+impl Drop for ReadEvent {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: handle created by `CreateEventW` above.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
+}
+
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
@@ -1134,19 +1183,65 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
+    let file_obj = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
     let started = std::time::Instant::now();
-    let mut done = 0;
-    let result = loop {
-        if done == out.len() {
-            break Ok(());
+    let result = if file_obj.overlapped {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_IO_PENDING, GetLastError};
+        use windows_sys::Win32::Storage::FileSystem::ReadFile;
+        use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+        let handle = file_obj.file.as_raw_handle();
+        let event = ReadEvent::get()?;
+        let mut done = 0usize;
+        loop {
+            if done == out.len() {
+                break Ok(());
+            }
+            let chunk = (out.len() - done).min(u32::MAX as usize) as u32;
+            let pos = request.offset + done as u64;
+            // SAFETY: zero-initialized Win32 OVERLAPPED with offset + event.
+            let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+            ov.Anonymous.Anonymous.Offset = pos as u32;
+            ov.Anonymous.Anonymous.OffsetHigh = (pos >> 32) as u32;
+            ov.hEvent = event;
+            let mut n = 0u32;
+            // SAFETY: `handle` is an open overlapped file, `out[done..]` has
+            // `chunk` writable bytes, and `ov` lives through `GetOverlappedResult`.
+            let ok = unsafe { ReadFile(handle, out[done..].as_mut_ptr(), chunk, &mut n, &mut ov) };
+            if ok == 0 {
+                // SAFETY: immediate error query after `ReadFile` failure.
+                let err = unsafe { GetLastError() };
+                if err == ERROR_IO_PENDING {
+                    // SAFETY: waits for the pending I/O on `ov` before `ov` or `out` drops.
+                    if unsafe { GetOverlappedResult(handle, &ov, &mut n, 1) } == 0 {
+                        let err2 = unsafe { GetLastError() };
+                        if err2 == ERROR_HANDLE_EOF {
+                            break Err(END_OF_FILE);
+                        }
+                        break Err(from_win32(&std::io::Error::from_raw_os_error(err2 as i32)));
+                    }
+                } else if err == ERROR_HANDLE_EOF {
+                    break Err(END_OF_FILE);
+                } else {
+                    break Err(from_win32(&std::io::Error::from_raw_os_error(err as i32)));
+                }
+            }
+            if n == 0 {
+                break Err(END_OF_FILE);
+            }
+            done += n as usize;
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
-            Ok(0) => break Err(END_OF_FILE),
-            Ok(n) => done += n,
-            Err(error) => break Err(from_win32(&error)),
+    } else {
+        let mut done = 0;
+        loop {
+            if done == out.len() {
+                break Ok(());
+            }
+            match file_obj.file.seek_read(&mut out[done..], request.offset + done as u64) {
+                Ok(0) => break Err(END_OF_FILE),
+                Ok(n) => done += n,
+                Err(error) => break Err(from_win32(&error)),
+            }
         }
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);

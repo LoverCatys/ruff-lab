@@ -5,8 +5,11 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+const SLOT_PLACED: u8 = 1;
+const SLOT_TEX: u8 = 2;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -101,6 +104,10 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// Per-slot lock-free hints (`SLOT_PLACED`, `SLOT_TEX`) so buffer-slot
+    /// writes skip locking `placed` and `textures` when the slot never held
+    /// a placed texture or texture-queue entry.
+    slot_flags: Box<[AtomicU8]>,
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -1062,6 +1069,9 @@ impl HostHeap {
                 }
                 spans
             },
+            slot_flags: (0..if sampler { 0 } else { count })
+                .map(|_| AtomicU8::new(0))
+                .collect(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1324,6 +1334,9 @@ impl HostHeap {
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         for &slot in &slots {
+            if let Some(f) = self.slot_flags.get(slot as usize) {
+                f.fetch_or(SLOT_TEX, Ordering::Release);
+            }
             textures.changed(slot, frame, frame + 1);
         }
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
@@ -1373,6 +1386,9 @@ impl HostHeap {
             return [held, slots.len(), 0];
         }
         for &slot in &slots {
+            if let Some(f) = self.slot_flags.get(slot as usize) {
+                f.fetch_or(SLOT_TEX, Ordering::Release);
+            }
             textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
         }
         [held, slots.len(), slots.len()]
@@ -1458,6 +1474,9 @@ impl HostHeap {
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         for &slot in &slots {
+            if let Some(f) = self.slot_flags.get(slot as usize) {
+                f.fetch_or(SLOT_TEX, Ordering::Release);
+            }
             textures.changed(slot, frame, frame + 1);
         }
         crate::tiles::STATS[10].fetch_add(slots.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1710,7 +1729,10 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        let slot_flag = self.slot_flags.get(index as usize);
+        let stale = if placed_view.is_some()
+            || slot_flag.is_none_or(|f| f.load(Ordering::Acquire) & SLOT_PLACED != 0)
+        {
             use std::sync::atomic::Ordering::Relaxed;
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let span = placed_view.and_then(|(resource, start, first)| {
@@ -1734,6 +1756,14 @@ impl HostHeap {
                     SPANNED[1].fetch_max(end, Relaxed);
                     let stale = placed.note(index, start, end, !seen);
                     placed.shows(index, first);
+                    if let Some(f) = slot_flag {
+                        f.fetch_or(SLOT_PLACED, Ordering::Release);
+                    }
+                    for &st in &stale {
+                        if let Some(sf) = self.slot_flags.get(st as usize) {
+                            sf.fetch_and(!SLOT_PLACED, Ordering::Release);
+                        }
+                    }
                     if let Some(held) = held_stripes {
                         debug_assert!(
                             stale.iter().all(|&st| st == index
@@ -1745,9 +1775,14 @@ impl HostHeap {
                 }
                 None => {
                     placed.forget(index);
+                    if let Some(f) = slot_flag {
+                        f.fetch_and(!SLOT_PLACED, Ordering::Release);
+                    }
                     Vec::new()
                 }
             }
+        } else {
+            Vec::new()
         };
         // Measured for the texture side of the same gap (textures a shader
         // picks by a computed index are neither made, if placed, nor
@@ -1764,7 +1799,24 @@ impl HostHeap {
             }
             _ => false,
         };
-        self.queue_texture_with_stale(index, texture, seen, frame, &stale);
+        if texture
+            || !stale.is_empty()
+            || slot_flag.is_none_or(|f| f.load(Ordering::Acquire) & SLOT_TEX != 0)
+        {
+            self.queue_texture_with_stale(index, texture, seen, frame, &stale);
+            if let Some(f) = slot_flag {
+                if texture {
+                    f.fetch_or(SLOT_TEX, Ordering::Release);
+                } else {
+                    f.fetch_and(!SLOT_TEX, Ordering::Release);
+                }
+            }
+            for &st in &stale {
+                if let Some(sf) = self.slot_flags.get(st as usize) {
+                    sf.fetch_and(!SLOT_TEX, Ordering::Release);
+                }
+            }
+        }
         if !stale.is_empty() {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1778,8 +1830,11 @@ impl HostHeap {
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
-            buffers.insert(index);
-            true
+            let inserted = buffers.insert(index);
+            // When `seen` is true (materializing an already-tracked buffer slot
+            // inside `heap_buffers` or a draw), do not re-enqueue it into
+            // `self.changed` unless it was newly added to `buffers`.
+            !seen || inserted
         } else {
             buffers.remove(&index)
         };
