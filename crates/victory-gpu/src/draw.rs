@@ -292,7 +292,19 @@ const WINDOW_MOST: u64 = 64;
 /// before, at the next submission.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    // On by default in Wave 6: clamps sequential indirect mesh records in
+    // windows up to 64 instead of issuing a compute dispatch + barrier per draw.
+    // `VICTORY_INDIRECT_WINDOW=0` restores per-record clamping.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
+}
+
+/// Whether non-texture (buffer and CBV) slots inside per-draw descriptor tables
+/// are marked `tabled` just like textures (`VICTORY_TABLED_BUFFERS`, default ON;
+/// `0` disables). Prevents `sync_heaps` from re-mirroring tens of thousands of
+/// per-draw buffer/CBV slots and flooding `heap_buffers` every frame.
+fn tabled_buffers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_BUFFERS").is_none_or(|v| v != "0"))
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -1669,20 +1681,15 @@ impl State {
             ranges.clear();
             slots = host.buffer_slots();
         } else {
-            let all = host.buffer_slots();
             let slice_idx = (pass % rescan) as usize;
-            let total = all.len();
-            if total > 0 {
-                let stride = rescan as usize;
-                let from = total * slice_idx / stride;
-                let to = total * (slice_idx + 1) / stride;
-                if from < to {
-                    slots.extend_from_slice(&all[from..to]);
-                }
+            let part = host.buffer_slots_part(slice_idx, rescan as usize);
+            if !part.is_empty() {
+                slots.extend_from_slice(&part);
+                slots.sort_unstable();
+                slots.dedup();
             }
             if slice_idx == 0 && !ranges.is_empty() {
-                let live: std::collections::HashSet<u32> = all.iter().copied().collect();
-                ranges.retain(|k, _| live.contains(k));
+                ranges.retain(|&k, _| host.has_buffer_slot(k));
             }
         }
         // Whether the device was there before the pass: a view that removes
@@ -2179,15 +2186,16 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
-        /// Bytes of texture memory staged per frame.
-        // `VICTORY_TEXTURE_STAGE_MB` (or `VICTORY_TEXTURE_QUEUE_MB`) sets it, 1024 by
-        // default: at 3-4 fps the fork's 192 left thousands of textures waiting for minutes.
+        /// Bytes of texture memory staged per frame in live gameplay.
+        // `VICTORY_TEXTURE_STAGE_MB` (or `VICTORY_TEXTURE_QUEUE_MB`) sets it;
+        // 256 MB keeps gameplay smooth while `preload_or_heap_textures` and
+        // loading-screen `early_textures` pass their own larger `PASS_BUDGET`.
         static PER_FRAME_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let per_frame: u64 = *PER_FRAME_MB.get_or_init(|| {
             ["VICTORY_TEXTURE_STAGE_MB", "VICTORY_TEXTURE_QUEUE_MB"]
                 .iter()
                 .find_map(|k| std::env::var(k).ok().and_then(|v| v.trim().parse().ok()))
-                .unwrap_or(1024)
+                .unwrap_or(256)
         }) << 20;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
@@ -2274,7 +2282,7 @@ impl State {
             ["VICTORY_TEXTURE_STAGE_MS", "VICTORY_TEXTURE_QUEUE_MS"]
                 .iter()
                 .find_map(|k| std::env::var(k).ok().and_then(|v| v.trim().parse().ok()))
-                .unwrap_or(1000)
+                .unwrap_or(10)
         }));
         // A backlog (a scene's first minutes: 22,000 slots due) may get three times the
         // bytes and the time until it drains: `VICTORY_TEXTURE_CATCHUP=1` (off by default
@@ -2984,9 +2992,11 @@ impl State {
         };
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u.kind, &view);
-            // Up to date by this draw: not the texture pass's to make.
+            // Up to date by this draw: not the texture or sync_heaps pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
+            } else if tabled_buffers() {
+                host.slot_tabled(index);
             }
         }
     }
@@ -3167,6 +3177,11 @@ impl State {
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        if let Some(title) = title_first
+                            && tabled_buffers()
+                        {
+                            host.slot_tabled(title + k);
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -3190,12 +3205,18 @@ impl State {
                         // (its texture is up to date now), and made in
                         // place as the texture pass would have made it,
                         // for a shader that picks it by index all the same.
-                        if let Some(title) = title_first
-                            && crate::descriptor::host::is_texture_view(&view)
-                        {
-                            host.texture_slot_tabled(title + k, kind.is_some());
-                            if kind.is_some() {
-                                host.mirror(title + k, table + u64::from(k) * 32, true);
+                        // Buffer slots in per-draw tables are also marked
+                        // tabled so `sync_heaps` skips re-mirroring them
+                        // and feeding tens of thousands of slots into
+                        // `heap_buffers` every frame.
+                        if let Some(title) = title_first {
+                            if crate::descriptor::host::is_texture_view(&view) {
+                                host.texture_slot_tabled(title + k, kind.is_some());
+                                if kind.is_some() {
+                                    host.mirror(title + k, table + u64::from(k) * 32, true);
+                                }
+                            } else if tabled_buffers() {
+                                host.slot_tabled(title + k);
                             }
                         }
                     }

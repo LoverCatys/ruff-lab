@@ -2782,6 +2782,7 @@ impl Shadow {
                             title[off..].as_ptr(),
                             len,
                         );
+                        crate::watch::note_landed(start + at + off, len);
                         written += len;
                     }
                 }
@@ -2884,6 +2885,7 @@ impl Shadow {
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::watch::note_landed(start + at, n);
         n
     }
 
@@ -3382,28 +3384,45 @@ impl Shadow {
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        if self.card.is_some() && to - from <= 16 << 20 && copy_changed() {
-            let n = to - from;
-            // SAFETY: `n` bytes inside the CPU-side mapping; ranges shaders are
-            // writing were excluded by `update`.
-            let held = unsafe { std::slice::from_raw_parts_mut(at, n) };
+        if self.card.is_some() && copy_changed() {
+            // Scan in 2 MiB chunks so large unwatched ping-pong buffers (>16 MiB,
+            // e.g. 21 MiB) also diff-upload only changed spans instead of
+            // re-uploading whole buffers every frame, while keeping per-thread
+            // scratch RAM small on 16 GB systems (`kitty-core/Kitty6` `60532f0`).
+            const CHUNK: usize = 2 << 20;
+            let total = to - from;
             thread_local! {
                 static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
             }
             return TITLE.with(|title| {
                 let mut title = title.borrow_mut();
-                title.clear();
-                title.extend_from_slice(held);
-                crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, n, false);
-                let runs = changed_spans(&title, held);
                 let mut copied_bytes = 0usize;
-                for &(r, m) in &runs {
-                    held[r..r + m].copy_from_slice(&title[r..r + m]);
-                    copied_bytes += m;
+                let mut first_dirty: Option<usize> = None;
+                let mut last_dirty = 0usize;
+                let mut off = 0usize;
+                while off < total {
+                    let n = CHUNK.min(total - off);
+                    // SAFETY: `[from + off, from + off + n)` lies inside the CPU-side
+                    // mapping; ranges shaders are writing were excluded by `update`.
+                    let held = unsafe { std::slice::from_raw_parts_mut(at.add(off), n) };
+                    title.clear();
+                    title.extend_from_slice(held);
+                    crate::host::copy_mapped(title.as_mut_ptr(), (from + off) as *const u8, n, false);
+                    let runs = changed_spans(&title, held);
+                    for &(r, m) in &runs {
+                        held[r..r + m].copy_from_slice(&title[r..r + m]);
+                        copied_bytes += m;
+                    }
+                    if let (Some(f), Some(l)) = (runs.first(), runs.last()) {
+                        let base = from - start + off;
+                        first_dirty = Some(first_dirty.map_or(base + f.0, |prev| prev.min(base + f.0)));
+                        last_dirty = last_dirty.max(base + l.0 + l.1);
+                        self.card_changed_runs(base, &runs);
+                    }
+                    off += n;
                 }
-                if let (Some(first), Some(last)) = (runs.first(), runs.last()) {
-                    self.changed(from - start + first.0, from - start + last.0 + last.1);
-                    self.card_changed_runs(from - start, &runs);
+                if let Some(first) = first_dirty {
+                    self.changed(first, last_dirty);
                 }
                 copied_bytes
             });
@@ -3586,6 +3605,7 @@ impl Shadow {
                 crate::watch::writing(start + at, n);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                crate::watch::note_landed(start + at, n);
                 written = n;
             }
         } else {
@@ -3665,6 +3685,7 @@ impl Shadow {
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::watch::note_landed(start + at, n);
         n
     }
 }

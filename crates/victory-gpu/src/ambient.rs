@@ -115,10 +115,18 @@ pub(crate) fn sky_drawn(image: usize) {
     }
 }
 
-/// Sky-dome-following ambient (`VICTORY_AMBIENT_SKY=1` or `gain,least,power`).
-/// Opt-in: in indoor scenes facing a dawn window (e.g. opening cell), the sky
-/// dome mean drops indoor ambient to ~0.08, crushing characters to silhouettes
-/// and blowing out auto-exposure; default stays constant `VICTORY_AMBIENT` (0.6).
+/// Default sky-following curve (`[gain, least, power]`): drops smoothly to
+/// ~0.10-0.13 in dark/night scenes (preventing white auto-exposure blowout on
+/// characters and cars), keeps dawn/indoor scenes ~0.18-0.30 (avoiding black
+/// silhouettes), and caps at `level` (0.6) in bright daylight.
+const DEFAULT_SKY: [f32; 3] = [0.44, 0.075, 0.36];
+
+/// Conservative fallback level when sky-following is active before the sky
+/// paraboloid has been drawn for the first time.
+const SKY_FALLBACK_CAP: f32 = 0.28;
+
+/// Sky-dome-following ambient (`VICTORY_AMBIENT_SKY`, ON by default with
+/// `0.44,0.075,0.36`; `off` or `0` reverts to constant `VICTORY_AMBIENT`).
 static FOLLOW: std::sync::Mutex<Option<Option<[f32; 3]>>> = std::sync::Mutex::new(None);
 
 fn follow() -> Option<[f32; 3]> {
@@ -128,14 +136,14 @@ fn follow() -> Option<[f32; 3]> {
     static SET: OnceLock<Option<[f32; 3]>> = OnceLock::new();
     *SET.get_or_init(|| {
         let Ok(set) = std::env::var("VICTORY_AMBIENT_SKY") else {
-            return None;
+            return Some(DEFAULT_SKY);
         };
         let trimmed = set.trim();
-        if trimmed.is_empty() || trimmed == "0" || trimmed == "off" {
+        if trimmed == "0" || trimmed.eq_ignore_ascii_case("off") {
             return None;
         }
-        let mut follow = [0.36, 0.05, 0.4];
-        if trimmed != "1" && trimmed != "on" {
+        let mut follow = DEFAULT_SKY;
+        if !trimmed.is_empty() && trimmed != "1" && !trimmed.eq_ignore_ascii_case("on") {
             for (to, v) in follow.iter_mut().zip(trimmed.split(',')) {
                 if let Ok(v) = v.trim().parse() {
                     *to = v;
@@ -144,6 +152,12 @@ fn follow() -> Option<[f32; 3]> {
         }
         Some(follow)
     })
+}
+
+/// CPU mirror of the HLSL sky-following brightness curve (used by unit tests).
+#[cfg(test)]
+fn sky_amount(mean_luma: f32, [gain, least, power]: [f32; 3], cap: f32) -> f32 {
+    (gain * mean_luma.max(0.0).powf(power) + least).min(cap.max(least))
 }
 
 /// Where the resolve reads the scene's depth (reversed, D32 with stencil):
@@ -239,6 +253,7 @@ float3 from_around() {
     if (gain <= 0.0) return tint * level;
     uint sw, sh, slices;
     sky.GetDimensions(sw, sh, slices);
+    if (sw == 0 || sh == 0) return tint * min(level, 0.28);
     float3 sum = 0.0;
     const int N = 8;
     for (int y = 0; y < N; y++)
@@ -247,10 +262,15 @@ float3 from_around() {
             sum += clamp(there, 0.0, 8.0);
         }
     float3 mean = sum / (N * N);
-    float m = dot(mean, float3(0.2126, 0.7152, 0.0722));
-    const float3 NIGHT = float3(0.6, 0.75, 1.0);
-    float3 hue = lerp(NIGHT, lerp(float3(1.0, 1.0, 1.0), mean / max(m, 1e-6), 0.5), saturate(m / 0.05));
-    return hue * (gain * pow(max(m, 0.0), power) + least);
+    const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
+    float m = dot(mean, LUMA);
+    // Unit-luma cool night tint so low-light interiors keep their calibrated brightness.
+    const float3 NIGHT = float3(0.80, 0.96, 1.24);
+    float3 sky_hue = mean / max(m, 1e-6);
+    float3 raw_hue = lerp(NIGHT, lerp(float3(1.0, 1.0, 1.0), sky_hue, 0.45), saturate(m / 0.04));
+    float3 hue = raw_hue / max(dot(raw_hue, LUMA), 1e-4);
+    float amount = min(gain * pow(max(m, 0.0), power) + least, max(level, least));
+    return hue * amount;
 }
 RWTexture2D<uint> light : register(u0);
 Texture2D<float> depth : register(t0);
@@ -537,12 +557,19 @@ fn record(list: &HostList, light: This, depth: Option<This>, held: f32) -> bool 
         l.SetComputeRootSignature(&pass.root);
         l.SetPipelineState(&pass.pso);
         let [r, g, b] = tint();
-        let level = live_level().unwrap_or(level);
+        let base_level = live_level().unwrap_or(level);
+        // When sky-following is active before the sky dome has been drawn,
+        // avoid flashing full daytime `0.6` in dark opening/night scenes.
+        let effective_level = if follow().is_some() && sky.is_none() {
+            base_level.min(SKY_FALLBACK_CAP)
+        } else {
+            base_level
+        };
         let [strength, radius, near, tan_y] = shade();
         let strength = if depth.is_some() { strength } else { 0.0 };
         let [gain, least, power] = sky.map_or([0.0, 0.0, 1.0], |s| s.1);
         let floor = *LEAST.lock().unwrap_or_else(|e| e.into_inner());
-        let constants = [level, r, g, b, strength, radius, near, tan_y, gain, least, held, floor, power];
+        let constants = [effective_level, r, g, b, strength, radius, near, tan_y, gain, least, held, floor, power];
         l.SetComputeRoot32BitConstants(0, 13, constants.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(
             1,
@@ -565,5 +592,15 @@ mod tests {
             return;
         };
         super::make(&host.device).expect("the ambient pass");
+    }
+
+    #[test]
+    fn sky_curve_tames_night_blowout_and_caps_daylight() {
+        let night = super::sky_amount(0.0005, super::DEFAULT_SKY, super::DEFAULT);
+        let dusk_cell = super::sky_amount(0.02, super::DEFAULT_SKY, super::DEFAULT);
+        let noon = super::sky_amount(3.0, super::DEFAULT_SKY, super::DEFAULT);
+        assert!(night >= 0.08 && night <= 0.13, "night={night}");
+        assert!(dusk_cell >= 0.16 && dusk_cell <= 0.24, "dusk_cell={dusk_cell}");
+        assert!((noon - super::DEFAULT).abs() < 1e-6, "noon={noon}");
     }
 }

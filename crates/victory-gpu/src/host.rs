@@ -70,8 +70,19 @@ unsafe impl Sync for Host {}
 /// the submission count they wait for. The title's descriptor writes and
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
-/// texture (a device hang).
-static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+/// texture (a device hang). Sharded into 16 thread-local buckets so parallel
+/// `heap_buffers` / `sync_heaps` / list recording threads never contend on one
+/// global retirement mutex (`kitty-core/Kitty6` `11511b8`).
+static RETIRED: [Mutex<Vec<(u64, Retired)>>; 16] = [const { Mutex::new(Vec::new()) }; 16];
+
+fn retired() -> std::sync::MutexGuard<'static, Vec<(u64, Retired)>> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    thread_local! {
+        static PART: usize = NEXT.fetch_add(1, Ordering::Relaxed) % RETIRED.len();
+    }
+    let part = PART.try_with(|p| *p).unwrap_or(0);
+    RETIRED[part].lock().unwrap_or_else(|e| e.into_inner())
+}
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -214,26 +225,25 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+    retired().push((started, Retired(Box::new(object))));
 }
 
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        if retired.is_empty() {
-            return;
-        }
-        let (done, keep) = std::mem::take(&mut *retired)
-            .into_iter()
-            .partition(|(at, _)| *at <= finished);
-        *retired = keep;
-        done
-    };
-    drop(done);
+    for part in &RETIRED {
+        let done: Vec<(u64, Retired)> = {
+            let mut retired = part.lock().unwrap_or_else(|e| e.into_inner());
+            if retired.is_empty() {
+                continue;
+            }
+            let (done, keep) = std::mem::take(&mut *retired)
+                .into_iter()
+                .partition(|(at, _)| *at <= finished);
+            *retired = keep;
+            done
+        };
+        drop(done);
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -2096,7 +2106,9 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 /// a fetch that finds nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    // On by default in Wave 6: joins per-range card rehash passes into
+    // contiguous piece runs (`VICTORY_CARD_REHASH_RUNS=0` restores per-range passes).
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -2114,7 +2126,9 @@ static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atom
 /// so eight threads take an eighth of them each.
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
+    // On by default in Wave 6: merges GPU copy-back pieces across worker
+    // threads (`VICTORY_WIDE_MERGE=0` runs merges serially).
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_none_or(|v| v != "0"))
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -2747,6 +2761,32 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// Whether a small upload fill (`<= 64 KiB`) skips waiting for in-flight shader
+/// writes when no shader copy-back landed on its 4 KiB pages within the last
+/// 600 frames (`VICTORY_FILL_TITLE=2`, default ON; `0` waits on any coarse
+/// written range overlap). Also supports opt-in `VICTORY_FILL_STALE_BYTES`
+/// (default `0`, disabled). Adapted from `kitty-core/Kitty6` (`11511b8`/`b6be7e3`).
+fn fill_is_titles(src: usize, len: usize) -> bool {
+    const SMALL: usize = 64 << 10;
+    static MODE: OnceLock<u32> = OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_FILL_TITLE").ok().as_deref() {
+        Some("0") => 0,
+        Some("1") => 1,
+        _ => 2,
+    });
+    if mode != 0 && len <= SMALL && !crate::watch::landed_lately(src, len, 600) {
+        return true;
+    }
+    static STALE_MAX: OnceLock<usize> = OnceLock::new();
+    let stale_max = *STALE_MAX.get_or_init(|| {
+        std::env::var("VICTORY_FILL_STALE_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    });
+    stale_max > 0 && len <= stale_max
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -2766,7 +2806,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 &Step::Fill(_, src, len) => {
-                    if touches(written, src, src + len) {
+                    if !fill_is_titles(src, len) && touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                         }
@@ -6597,7 +6637,9 @@ impl HostList {
 /// they are for the title's threads.
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+    // On by default in Wave 6: fans out per-copy refreshes across worker
+    // threads (`VICTORY_WIDE_REFRESH=0` runs refreshes serially).
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_none_or(|v| v != "0"))
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the

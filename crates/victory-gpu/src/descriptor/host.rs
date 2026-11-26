@@ -18,9 +18,162 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 /// Power-of-two stripes for slow-path descriptor slot locks and `kept` storage.
-const SLOT_LOCK_STRIPES: usize = 256;
-const SLOT_LOCK_SHIFT: usize = 8;
+/// 4096 stripes eliminate contention across parallel `sync_heaps` / `heap_buffers`
+/// and recording threads (`kitty-core/Kitty6` `11511b8`).
+const SLOT_LOCK_STRIPES: usize = 4096;
+const SLOT_LOCK_SHIFT: usize = 12;
 const _: () = assert!(SLOT_LOCK_STRIPES == 1 << SLOT_LOCK_SHIFT);
+
+/// Lock-free atomic bitset of title descriptor slots (one bit per slot).
+/// Replaces `Mutex<BTreeSet<u32>>` / `Mutex<HashSet<u32>>` for `buffers` and
+/// `changed`, and masks out unrelated round-robin parts before scanning bits
+/// (`kitty-core/Kitty6` `ab9f1b7`).
+struct Slots(Box<[AtomicU64]>);
+
+impl Slots {
+    fn new(count: usize) -> Self {
+        Self((0..count.div_ceil(64)).map(|_| AtomicU64::new(0)).collect())
+    }
+
+    /// Sets or clears `index`; returns whether its bit was previously set.
+    fn set(&self, index: u32, on: bool) -> bool {
+        let Some(word) = self.0.get(index as usize / 64) else {
+            return false;
+        };
+        let bit = 1u64 << (index % 64);
+        let prev = if on {
+            word.fetch_or(bit, Ordering::AcqRel)
+        } else {
+            word.fetch_and(!bit, Ordering::AcqRel)
+        };
+        prev & bit != 0
+    }
+
+    fn contains(&self, index: u32) -> bool {
+        self.0
+            .get(index as usize / 64)
+            .is_some_and(|word| word.load(Ordering::Acquire) & (1u64 << (index % 64)) != 0)
+    }
+
+    fn all(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        for (i, word) in self.0.iter().enumerate() {
+            let mut w = word.load(Ordering::Acquire);
+            let base = (i * 64) as u32;
+            while w != 0 {
+                let bit = w.trailing_zeros();
+                out.push(base + bit);
+                w &= w - 1;
+            }
+        }
+        out
+    }
+
+    fn take_all(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        for (i, word) in self.0.iter().enumerate() {
+            if word.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            let mut w = word.swap(0, Ordering::AcqRel);
+            let base = (i * 64) as u32;
+            while w != 0 {
+                let bit = w.trailing_zeros();
+                out.push(base + bit);
+                w &= w - 1;
+            }
+        }
+        out
+    }
+
+    /// Returns all set slots with `slot % parts == which`, masking out
+    /// unrelated bits before scanning (`kitty-core/Kitty6` `ab9f1b7`).
+    fn part_of(&self, which: usize, parts: usize) -> Vec<u32> {
+        if parts <= 1 {
+            return self.all();
+        }
+        let which = which % parts;
+        let mut out = Vec::new();
+        if parts == 64 {
+            let bit = 1u64 << which;
+            for (i, word) in self.0.iter().enumerate() {
+                if word.load(Ordering::Acquire) & bit != 0 {
+                    out.push((i * 64 + which) as u32);
+                }
+            }
+            return out;
+        }
+        if parts.is_power_of_two() && parts < 64 {
+            let mut mask = 0u64;
+            let mut b = which;
+            while b < 64 {
+                mask |= 1u64 << b;
+                b += parts;
+            }
+            for (i, word) in self.0.iter().enumerate() {
+                let mut w = word.load(Ordering::Acquire) & mask;
+                let base = (i * 64) as u32;
+                while w != 0 {
+                    let bit = w.trailing_zeros();
+                    out.push(base + bit);
+                    w &= w - 1;
+                }
+            }
+            return out;
+        }
+        for (i, word) in self.0.iter().enumerate() {
+            let base = i * 64;
+            let mut w = word.load(Ordering::Acquire);
+            if w == 0 {
+                continue;
+            }
+            let mut mask = 0u64;
+            let rem = base % parts;
+            let first = (which + parts - rem) % parts;
+            let mut b = first;
+            while b < 64 {
+                mask |= 1u64 << b;
+                b += parts;
+            }
+            w &= mask;
+            while w != 0 {
+                let bit = w.trailing_zeros();
+                out.push(base as u32 + bit);
+                w &= w - 1;
+            }
+        }
+        out
+    }
+}
+
+/// Lock-free shadow bitset for [`TextureQueue`]: non-texture descriptors skip
+/// taking the `textures` mutex when their slot is not queued
+/// (`kitty-core/Kitty6` `11511b8`).
+#[derive(Default)]
+struct Queued(Box<[AtomicU64]>);
+
+impl Queued {
+    fn new(slots: u32) -> Self {
+        Self((0..slots.div_ceil(64)).map(|_| AtomicU64::new(0)).collect())
+    }
+
+    fn set(&self, slot: u32, there: bool) {
+        if let Some(word) = self.0.get(slot as usize / 64) {
+            let bit = 1u64 << (slot % 64);
+            if there {
+                word.fetch_or(bit, Ordering::SeqCst);
+            } else {
+                word.fetch_and(!bit, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn may(&self, slot: u32) -> bool {
+        self.0
+            .get(slot as usize / 64)
+            .is_none_or(|w| (w.load(Ordering::SeqCst) >> (slot % 64)) & 1 != 0)
+    }
+}
 
 #[repr(align(64))]
 struct StripeLock<T>(Mutex<T>);
@@ -76,16 +229,18 @@ pub(crate) struct HostHeap {
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
     /// buffers from the whole heap.
-    buffers: Mutex<std::collections::BTreeSet<u32>>,
+    buffers: Slots,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
-    changed: Mutex<std::collections::HashSet<u32>>,
+    changed: Slots,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
     /// table; one a shader picks by a computed index is brought up to date
     /// from here ([`HostHeap::texture_slots_due`]).
     textures: Mutex<TextureQueue>,
+    /// Lock-free mirror of [`TextureQueue::slots`] membership.
+    queued: std::sync::Arc<Queued>,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
     /// read it through a table, or made a table it lies in (with
     /// [`TABLED_READ`] set if the draw read it). The draw that
@@ -595,9 +750,29 @@ pub(crate) struct TextureQueue {
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
     held: std::collections::BTreeMap<u32, u64>,
+    /// Lock-free membership bits synced under this queue's lock.
+    queued: std::sync::Arc<Queued>,
 }
 
+/// Slots due of a [`TextureQueue`], split into `[again, fresh]`, for
+/// [`TextureQueue::in_order`] outside the queue lock.
+type Due = [Vec<(u64, u32, u64)>; 2];
+
 impl TextureQueue {
+    fn insert(&mut self, index: u32, waiting: Waiting) {
+        if self.slots.insert(index, waiting).is_none() {
+            self.queued.set(index, true);
+        }
+    }
+
+    fn take_out(&mut self, index: u32) -> bool {
+        let was = self.slots.remove(&index).is_some();
+        if was {
+            self.queued.set(index, false);
+        }
+        was
+    }
+
     /// A texture view was written into slot `index` in `frame`, due from
     /// frame `due`. `seen`: it was not written, a draw or the pass made
     /// the host slot from a view the queue may hold already, which then
@@ -608,11 +783,11 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
     }
 
     fn remove(&mut self, index: u32) {
-        self.slots.remove(&index);
+        self.take_out(index);
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
@@ -625,13 +800,22 @@ impl TextureQueue {
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
+    #[cfg(test)]
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+        Self::in_order(self.all_due(frame), max)
+    }
+
+    /// Collects the slots due at `frame` under the queue lock; sorting runs
+    /// lock-free in [`TextureQueue::in_order`] (`kitty-core/Kitty6` `11511b8`).
+    fn all_due(&self, frame: u64) -> Due {
+        let mut due = Due::default();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-            class.push((w.written, index, w.write));
+            due[usize::from(w.looks == 0 && w.mapped == 0)].push((w.written, index, w.write));
         }
+        due
+    }
+
+    fn in_order([mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
@@ -658,7 +842,7 @@ impl TextureQueue {
     /// Slot `index` is up to date: out of the queue until written again.
     fn done(&mut self, index: u32, write: u64) {
         if self.same(index, write).is_some() {
-            self.slots.remove(&index);
+            self.take_out(index);
         }
     }
 
@@ -736,7 +920,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1128,6 +1312,8 @@ impl HostHeap {
             })
             .flatten();
         let total = (count + extra) as usize;
+        let queued = std::sync::Arc::new(Queued::new(if sampler { 0 } else { count }));
+        let tracked_slots = if sampler { 0 } else { count as usize };
         let h = HostHeap {
             heap,
             cpu,
@@ -1150,9 +1336,13 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
-            buffers: Mutex::default(),
-            changed: Mutex::default(),
-            textures: Mutex::default(),
+            buffers: Slots::new(tracked_slots),
+            changed: Slots::new(tracked_slots),
+            textures: Mutex::new(TextureQueue {
+                queued: queued.clone(),
+                ..Default::default()
+            }),
+            queued,
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
@@ -1330,8 +1520,18 @@ impl HostHeap {
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+        let (due, census) = {
+            let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                if max == 0 {
+                    Due::default()
+                } else {
+                    textures.all_due(frame)
+                },
+                textures.census(frame),
+            )
+        };
+        (TextureQueue::in_order(due, max), census)
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -1697,6 +1897,22 @@ impl HostHeap {
         self.tabled_in(index, read, crate::frame::current());
     }
 
+    /// Marks title slot `index` as belonging to a per-draw descriptor table
+    /// (buffers and CBVs) without touching the texture queue, so `sync_heaps`
+    /// (`mirror_copied`) skips re-mirroring tens of thousands of per-draw
+    /// buffer/CBV slots every frame and feeding them into `heap_buffers`.
+    pub(crate) fn slot_tabled(&self, index: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(stamp) = self.tabled.get(index as usize) else {
+            return;
+        };
+        let now = (crate::frame::current() as u32).wrapping_add(1) & !TABLED_READ;
+        let old = stamp.load(Relaxed);
+        if old & !TABLED_READ != now {
+            stamp.store(now, Relaxed);
+        }
+    }
+
     /// [`HostHeap::texture_slot_tabled`] in frame `frame`.
     fn tabled_in(&self, index: u32, read: bool, frame: u64) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1714,9 +1930,9 @@ impl HostHeap {
         // Once per slot and frame: tables are read by every draw.
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
-            if tabled_out() {
+            if tabled_out() && self.queued.may(index) {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                if textures.slots.remove(&index).is_some() {
+                if textures.take_out(index) {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
             }
@@ -1763,6 +1979,9 @@ impl HostHeap {
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
+        if !(texture && !read_now) && stale.is_empty() && !self.queued.may(index) {
+            return;
+        }
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         if texture && !read_now {
             let due = if lately && !seen {
@@ -1782,15 +2001,24 @@ impl HostHeap {
 
     /// The title slots that hold buffer views.
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
-        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.iter().copied().collect()
+        self.buffers.all()
+    }
+
+    /// Rotating `which`-th slice of `parts` of the title slots holding buffer
+    /// views, scanned lock-free with bit masking (`kitty-core/Kitty6` `ab9f1b7`).
+    pub(crate) fn buffer_slots_part(&self, which: usize, parts: usize) -> Vec<u32> {
+        self.buffers.part_of(which, parts)
+    }
+
+    /// Lock-free membership check for a tracked buffer view slot.
+    pub(crate) fn has_buffer_slot(&self, index: u32) -> bool {
+        self.buffers.contains(index)
     }
 
     /// The title slots whose buffer view was written, or went, since the
     /// last call.
     pub(crate) fn buffer_changes(&self) -> Vec<u32> {
-        let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *changed).into_iter().collect()
+        self.changed.take_all()
     }
 
     #[cfg(test)]
@@ -1935,21 +2163,17 @@ impl HostHeap {
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
         }
-        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
-            let inserted = buffers.insert(index);
+            let existed = self.buffers.set(index, true);
             // When `seen` is true (materializing an already-tracked buffer slot
             // inside `heap_buffers` or a draw), do not re-enqueue it into
             // `self.changed` unless it was newly added to `buffers`.
-            !seen || inserted
+            !seen || !existed
         } else {
-            buffers.remove(&index)
+            self.buffers.set(index, false)
         };
         if was {
-            self.changed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(index);
+            self.changed.set(index, true);
         }
         Ok(stale)
     }
@@ -4102,6 +4326,42 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    #[test]
+    fn slots_bitset_parts_and_take_all() {
+        let slots = Slots::new(300);
+        let sample = [0u32, 1, 17, 63, 64, 65, 128, 129, 191, 255, 299];
+        for &s in &sample {
+            assert!(!slots.set(s, true));
+            assert!(slots.contains(s));
+        }
+        assert_eq!(slots.all(), sample);
+        // 64-way partition covers every slot exactly once.
+        let mut union = Vec::new();
+        for which in 0..64 {
+            let part = slots.part_of(which, 64);
+            for &s in &part {
+                assert_eq!(s as usize % 64, which);
+            }
+            union.extend(part);
+        }
+        union.sort_unstable();
+        assert_eq!(union, sample);
+        // Non-power-of-two partition (e.g., 7) also partitions cleanly.
+        let mut union7 = Vec::new();
+        for which in 0..7 {
+            let part = slots.part_of(which, 7);
+            for &s in &part {
+                assert_eq!(s as usize % 7, which);
+            }
+            union7.extend(part);
+        }
+        union7.sort_unstable();
+        assert_eq!(union7, sample);
+        // `take_all` drains and clears atomically.
+        assert_eq!(slots.take_all(), sample);
+        assert!(slots.all().is_empty());
     }
 
     #[test]

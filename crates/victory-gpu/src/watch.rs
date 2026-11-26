@@ -26,6 +26,69 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
+/// Pages (4 KiB) that shader copy-back actually wrote into title memory, mapped
+/// to the frame number of the most recent landing (`VICTORY_FILL_TITLE=2`,
+/// adapted from `kitty-core/Kitty6` `11511b8` / `b6be7e3`).
+static LANDED: std::sync::RwLock<Option<std::collections::HashMap<usize, u64>>> =
+    std::sync::RwLock::new(None);
+
+/// Records that shader copy-back landed bytes into title memory `[at, at + len)`.
+pub(crate) fn note_landed(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let frame = crate::frame::current().max(1);
+    let first = at / KERNEL_PAGE;
+    let last = at.saturating_add(len).div_ceil(KERNEL_PAGE);
+    if let Ok(guard) = LANDED.read()
+        && let Some(map) = guard.as_ref()
+        && (first..last).all(|p| map.get(&p).copied() == Some(frame))
+    {
+        return;
+    }
+    let mut guard = LANDED.write().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    for p in first..last {
+        map.insert(p, frame);
+    }
+    if map.len() > 65_536 {
+        let cutoff = frame.saturating_sub(2048);
+        map.retain(|_, &mut when| when >= cutoff);
+    }
+}
+
+/// Whether shader copy-back landed into any 4 KiB page overlapping `[at, at + len)`
+/// within the last `frames` frames.
+pub(crate) fn landed_lately(at: usize, len: usize, frames: u64) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let guard = LANDED.read().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = guard.as_ref() else {
+        return false;
+    };
+    let frame = crate::frame::current().max(1);
+    let first = at / KERNEL_PAGE;
+    let last = at.saturating_add(len).div_ceil(KERNEL_PAGE);
+    (first..last).any(|p| map.get(&p).is_some_and(|&when| frame.saturating_sub(when) <= frames))
+}
+
+#[cfg(test)]
+mod landed_tests {
+    use super::{KERNEL_PAGE, landed_lately, note_landed};
+
+    #[test]
+    fn note_landed_and_landed_lately_track_4k_pages() {
+        let base = 0x7FFF_0000_0000usize;
+        assert!(!landed_lately(base, 512, 600));
+        note_landed(base + 128, 256);
+        assert!(landed_lately(base, 64, 600));
+        assert!(landed_lately(base + 128, 256, 600));
+        assert!(!landed_lately(base + KERNEL_PAGE, 64, 600));
+        assert!(!landed_lately(base, 0, 600));
+    }
+}
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.
@@ -352,9 +415,16 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // View memory the guards already hold cannot be write-watched: the
-    // kernel asking would only fail. Copies of it are flushed many times a
-    // frame, each time paying that failed call before the guards answer.
-    let known_view = guarded && known_view(first * PAGE);
+    // kernel asking would only fail. Skip the kernel syscall both for guarded
+    // callers (which fall through to the guards) and for unguarded callers like
+    // textures (~300 failed syscalls/frame, `kitty-core/Kitty6` `65f9707`).
+    let is_known_view = known_view(first * PAGE);
+    if !guarded && is_known_view {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::WatchKnownView, 1);
+        return None;
+    }
+    let known_view = guarded && is_known_view;
     // SAFETY: the answer buffer holds `count` entries.
     let failed = known_view
         || unsafe {
