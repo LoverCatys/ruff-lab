@@ -2139,6 +2139,18 @@ pub(crate) fn let_go_idle() {
     if commit_short(100) {
         idle_ms = idle_ms.min(1_000);
     }
+    // Under PC physical RAM pressure (< 3 GiB free), idle textures spilled
+    // to system memory are evicted after 5 s with no LRU byte cap
+    // (`kitty-core/Kitty6` `e29ee1a` / Victory-United `00a21ef4`;
+    // `VICTORY_TEXTURE_PRESSURE_IDLE=0` disables).
+    static PRESSURE_IDLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let pressure_idle = *PRESSURE_IDLE
+        .get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PRESSURE_IDLE").is_none_or(|v| v != "0"));
+    let ram_pressured = pressure_idle
+        && crate::host::available_physical_ram().is_some_and(|free| free < 3 * (1024 << 20));
+    if ram_pressured {
+        idle_ms = idle_ms.min(5_000);
+    }
     // `VICTORY_TEXTURE_LRU=1` (from PastiiJay/klbf-lab `0ea9755`, after
     // AKA0GHOST/victory-fork e3aa169 & 7daa701): evict oldest idle copies
     // first, stopping once video memory drops under `VICTORY_TEXTURE_KEEP_PERCENT`
@@ -2159,7 +2171,7 @@ pub(crate) fn let_go_idle() {
             .map_or(default_keep, |p| p.clamp(40, room_percent()))
     });
     let mut over = match video {
-        Some([budget, used, ..]) if lru && !commit_short(100) => {
+        Some([budget, used, ..]) if lru && !commit_short(100) && !ram_pressured => {
             used.saturating_sub(budget / 100 * keep)
         }
         _ => u64::MAX,

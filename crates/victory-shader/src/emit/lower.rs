@@ -25,6 +25,11 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+/// Format loads that move 16-bit halves without the d16 form, a child
+/// module so it shares the emitter's state.
+#[path = "halves.rs"]
+mod halves;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -55,6 +60,8 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// See [`super::HostShader::half_views`].
+    pub half_views: Vec<(u8, u32)>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -204,6 +211,11 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Table descriptors read or written sixteen bits a channel
+    /// ([`super::HostShader::half_views`]): root parameter, dword offset.
+    half_views: std::collections::BTreeSet<(u8, u32)>,
+    /// [`Self::places_read_as_halves`], computed before lowering blocks.
+    halves_only: std::collections::BTreeSet<(u8, u32)>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -1286,6 +1298,39 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// Whether a pixel program asks for the depth test before it runs
+/// (`DB_SHADER_CONTROL` bit 12, HLSL `[earlydepthstencil]`), unless it exports
+/// depth, stencil or coverage (`kitty-core/Kitty6` `c0f8b6d` / myokex `c3723f3`).
+pub(super) fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
+    const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+    const EXPORTS: u32 = 0b111 | 1 << 8;
+    let StageIo::Ps {
+        db_shader_control, ..
+    } = io
+    else {
+        return false;
+    };
+    // SV_Depth, SV_DepthLessEqual, SV_DepthGreaterEqual, SV_Coverage, SV_StencilRef.
+    db_shader_control & DEPTH_BEFORE_SHADER != 0
+        && db_shader_control & EXPORTS == 0
+        && !outputs
+            .iter()
+            .any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
+}
+
+/// `VICTORY_EARLY_DEPTH=0` disables declaring `ForceEarlyDepthStencil`.
+fn early_depth_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_D16_BITS` (default 1; `0` disables): preserve raw 16-bit integer
+/// bits on d16 image loads and gathers (`kitty-core/Kitty6` `c0f8b6d`).
+fn d16_bits_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_D16_BITS").is_none_or(|v| v != "0"))
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -1298,6 +1343,9 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if early_depth_on() && early_depth(&x.native.io, &x.outputs) {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let scalar: HashMap<Site, Address> = x.res.scalar.iter().copied().collect();
         let desc_addr = |load: Site, first: u8| {
             let a = scalar.get(&load)?;
@@ -1602,6 +1650,8 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            half_views: Default::default(),
+            halves_only: Default::default(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -2352,6 +2402,7 @@ impl<'a> Lower<'a> {
         }
         self.cur = self.s.entry;
         self.find_sections();
+        self.halves_only = self.places_read_as_halves();
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
@@ -2412,6 +2463,7 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+        let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         Ok(Lowered {
@@ -2420,6 +2472,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            half_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -6066,7 +6119,14 @@ impl<'a> Lower<'a> {
                 let props = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
                 {
-                    (10 | u, 0x409)
+                    let halves = self
+                        .table_place(&Source::Loaded { load: site, first })
+                        .is_some_and(|p| {
+                            un.contains("_format_d16_")
+                                || (self.halves_only.contains(&p)
+                                    && self.format_load_read_as_halves(ui))
+                        });
+                    (10 | u, if halves { 0x405 } else { 0x409 })
                 } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
                     (12 | u, stride)
                 } else {
@@ -6510,6 +6570,36 @@ impl<'a> Lower<'a> {
             Some(u) => u.kind == ResourceType::Uav,
             None => in_set(&self.glc_uavs),
         }
+    }
+
+    /// Preserve raw 16-bit integer bits on d16 image loads and gathers through
+    /// integer views (`VICTORY_D16_BITS`, `kitty-core/Kitty6` `c0f8b6d`).
+    fn d16_bits(&mut self, x: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let half = self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x]);
+        if !d16_bits_on() {
+            return half;
+        }
+        let bits = self.as_int(x);
+        let (top, neg) = (self.s.m.i32(0xFFFF), self.s.m.i32(0xFFFF_7FFF));
+        let small = self.s.m.cmp(c, pred::IULE, bits, top);
+        let negative = self.s.m.cmp(c, pred::IUGT, bits, neg);
+        let integer = self.s.m.bin(c, Bin::Or, small, negative);
+        let low = self.s.m.bin(c, Bin::And, bits, top);
+        self.s.m.select(c, integer, low, half)
+    }
+
+    /// The table descriptor `src` is, as `(root parameter, dword in table)`,
+    /// when loaded from a fixed offset in a descriptor table (`ee7694e`).
+    fn table_place(&self, src: &Source) -> Option<(u8, u32)> {
+        let Source::Loaded { load, first } = src else {
+            return None;
+        };
+        let a = self.scalar.get(load)?;
+        let rp = self.x.native.layout.get(a.param)?;
+        (rp.root == RootType::Table && a.dynamic.is_none())
+            .then(|| (rp.slot, a.offset / 4 + u32::from(*first)))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -7439,13 +7529,22 @@ impl<'a> Lower<'a> {
                     return Err("an accumulator");
                 };
                 let acc = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
-                let acc = match self.floats.get(&acc) {
+                let mut acc = match self.floats.get(&acc) {
                     Some(&x) => x,
                     None => {
                         let x = self.i32_of(acc)?;
                         self.as_float(x)
                     }
                 };
+                // VOP3 bit 2 of abs/neg modifies the accumulator (dst) on RDNA 2
+                // (`kitty-core/Kitty6` `fdca008` / upstream #3158).
+                if v.abs >> 2 & 1 != 0 {
+                    acc = self.unary(6, acc);
+                }
+                if v.neg >> 2 & 1 != 0 {
+                    let z = self.s.m.f32(0x8000_0000);
+                    acc = self.s.m.bin(c, Bin::Sub, z, acc);
+                }
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
@@ -10534,11 +10633,16 @@ impl<'a> Lower<'a> {
                 None => self.s.m.extract(c, r, ch),
             };
             xs.push(if *d16 {
-                // shortcut: d16 results are taken as floats (rounded to
-                // nearest even); integer formats would keep 16 bits.
-                let i32t = self.s.t.i32;
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
+                // d16 results are taken as floats (rounded to nearest even);
+                // loads and gathers through integer views keep their 16 bits
+                // (`Self::d16_bits`, `VICTORY_D16_BITS`).
+                if matches!(op, 66 | 73) {
+                    self.d16_bits(x)
+                } else {
+                    let i32t = self.s.t.i32;
+                    self.s
+                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
+                }
             } else {
                 self.as_int(x)
             });
@@ -10702,6 +10806,16 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
+        // Sixteen bits a channel through a fixed table descriptor: move raw
+        // unsigned 16-bit values (`HostShader::half_views`, `kitty-core/Kitty6`
+        // `68cef8b` + `ee7694e` + `a20904c`), fixing the facial blendshape network.
+        let place = typed.then(|| self.table_place(src)).flatten().filter(|p| {
+            d16 || (self.halves_only.contains(p) && self.format_load_read_as_halves(inst))
+        });
+        let halves = place.is_some();
+        if let Some(place) = place {
+            self.half_views.insert(place);
+        }
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);
@@ -10916,14 +11030,19 @@ impl<'a> Lower<'a> {
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
             if d16 {
-                // shortcut: d16 data is taken as f16 (integer formats would
-                // keep 16 bits), widened for the 32-bit float store.
+                // Through a fixed table view each half is stored as raw 16-bit
+                // unsigned bits (`halves`); otherwise widened as f16 -> f32.
                 let mut wide = Vec::new();
                 for k in 0..count {
                     let mut x = vals[(k / 2) as usize];
                     if k % 2 == 1 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(c, Bin::LShr, x, k16);
+                    }
+                    if halves {
+                        let low = self.s.m.i32(0xffff);
+                        wide.push(self.s.m.bin(c, Bin::And, x, low));
+                        continue;
                     }
                     let f32t = self.s.t.f32;
                     let f = self
@@ -10935,18 +11054,21 @@ impl<'a> Lower<'a> {
             }
             let mut args = Vec::new();
             let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format.
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
-                args.push(self.handle(site, src, false, (10 | u, 0x409))?);
+                let component = if halves { 0x405 } else { 0x409 };
+                args.push(self.handle(site, src, false, (10 | u, component))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
-                    let f = self.as_float(x);
-                    args.push(self.nan_guard(f, false));
+                    args.push(if halves {
+                        x
+                    } else {
+                        let f = self.as_float(x);
+                        self.nan_guard(f, false)
+                    });
                 }
-                (69, "bufferStore.f32")
+                (69, if halves { "bufferStore.i32" } else { "bufferStore.f32" })
             } else {
                 match index {
                     // A raw buffer (stride 1) written by index: the index is the byte.
@@ -11002,16 +11124,24 @@ impl<'a> Lower<'a> {
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
             let index = index.unwrap_or(self.s.m.i32(0));
-            self.s.op(
-                c,
-                "bufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                68,
-                &[h, index, iu],
-            )
+            if halves {
+                let h = self.handle(site, src, false, (10 | u, 0x405))?;
+                let i32t = self.s.t.i32;
+                let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
+                self.s
+                    .op(c, "bufferLoad.i32", Attr::ReadOnly, ret, 68, &[h, index, iu])
+            } else {
+                let h = self.handle(site, src, false, (10 | u, 0x409))?;
+                self.s.op(
+                    c,
+                    "bufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    68,
+                    &[h, index, iu],
+                )
+            }
         } else {
             let mask = self.s.m.i8((1u8 << count) - 1);
             let align = self.s.m.i32(4);
@@ -11061,16 +11191,21 @@ impl<'a> Lower<'a> {
             return Err("a buffer result");
         };
         if d16 {
-            // Two f16 channels per VGPR (an odd last high half 0).
+            // Two 16-bit channels per VGPR (an odd last high half 0): raw bits
+            // for `halves` table views, f16 conversion otherwise.
             let k16 = self.s.m.i32(16);
             let i32t = self.s.t.i32;
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.s.m.extract(c, r, ch);
-                    let h = self
-                        .s
-                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                    let h = if halves {
+                        let low = self.s.m.i32(0xffff);
+                        self.s.m.bin(c, Bin::And, f, low)
+                    } else {
+                        self.s
+                            .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                    };
                     x = Some(match x {
                         Some(hi) => {
                             let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
@@ -11085,7 +11220,8 @@ impl<'a> Lower<'a> {
         }
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
-            let x = self.as_int(x);
+            // (Integers already where the load moved halves.)
+            let x = if halves { x } else { self.as_int(x) };
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())

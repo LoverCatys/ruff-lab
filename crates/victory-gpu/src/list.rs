@@ -199,6 +199,27 @@ pub(crate) struct Detached {
     _state: crate::draw::State,
 }
 
+/// Whether the descriptor tables of a flight's lists go back when it has
+/// landed, not with its host lists after `crate::host`'s bury lag
+/// (`VICTORY_EARLY_TABLES`, on by default; `0` disables; `kitty-core/Kitty6` `9cc794d`).
+#[cfg(windows)]
+fn early_tables() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_TABLES").is_none_or(|v| v != "0"))
+}
+
+/// A flight has landed: with [`early_tables`], its lists' descriptor table
+/// slots go back now instead of waiting for the 64-submission bury lag.
+#[cfg(windows)]
+pub(crate) fn tables_early(lists: &mut [Detached]) {
+    if !early_tables() {
+        return;
+    }
+    for list in lists {
+        list._state.tables_done();
+    }
+}
+
 #[cfg(windows)]
 impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {

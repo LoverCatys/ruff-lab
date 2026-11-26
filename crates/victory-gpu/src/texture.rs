@@ -240,7 +240,11 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    list.first_use(placed as usize);
+    // (fxceless 19a45d1 / kitty-core/Kitty6 `cd537b7`) An upload of this view
+    // from title memory earlier in the list has used its first use already:
+    // only a copy from the same card-written source satisfies this read.
+    let new_source = list.alias_source_changed(to, from);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -255,7 +259,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);

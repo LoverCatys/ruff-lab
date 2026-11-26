@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -1151,11 +1151,16 @@ mod relay_tests {
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
+/// When a snapshot buffer was last taken from or given back to [`POOL`]
+/// ([`crate::host::moment`]), for [`let_go_idle_snapshots`].
+static POOL_USED: AtomicU64 = AtomicU64::new(0);
+
 /// An empty buffer with room for `n` bytes, from the pool if it has one
 /// of about that size: a small copy's snapshot took the 174 MB buffer kept
 /// for the big heap's, which then got another, until eight of them were
 /// reserved (1.4 GB in run 24).
 fn pooled(n: usize) -> Vec<u8> {
+    POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let most = n.saturating_mul(4).max(1 << 20);
     let fit = pool
@@ -1176,16 +1181,133 @@ fn pooled(n: usize) -> Vec<u8> {
 /// of those the largest one and the next ones up to `KEPT` bytes in all.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
+    POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
+    let gone = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        pool.push(v);
+        pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+        let mut gone = if pool.len() > 8 { pool.split_off(8) } else { Vec::new() };
+        let (mut seen, mut total) = (0, 0usize);
+        let mut i = 0;
+        while i < pool.len() {
+            seen += 1;
+            total = total.saturating_add(pool[i].capacity());
+            if seen == 1 || total <= KEPT {
+                i += 1;
+            } else {
+                gone.push(pool.remove(i));
+            }
+        }
+        gone
+    };
+    drop(gone);
+}
+
+/// What [`POOL`] keeps while the host is short of physical RAM
+/// (`available_physical_ram() < 3 GiB`): the smallest buffers, up to this
+/// many bytes in all (`kitty-core/Kitty6` `9ea429c` / Vice-Tay PR #41).
+const POOL_PRESSURED_KEPT: usize = 32 << 20;
+
+/// Lets go of the snapshot buffers [`POOL`] keeps when nobody wants them:
+/// - idle for [`crate::host::ram_idle_ms`] and four frames: emptied;
+/// - while free physical RAM is below 3 GiB: shrunk to [`POOL_PRESSURED_KEPT`],
+///   dropping the largest buffers first.
+///
+/// `VICTORY_SNAPSHOT_POOL_IDLE=0` keeps the old behavior.
+fn let_go_idle_snapshots() {
+    const IDLE_FRAMES: u64 = 4;
+    const PRESSURE_RAM: u64 = 3 * (1024 << 20);
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SNAPSHOT_POOL_IDLE").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let avail = crate::host::available_physical_ram();
+    let idle_ms = crate::host::ram_idle_ms(avail);
+    let idle = crate::host::long_ago(POOL_USED.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES);
+    let pressured = avail.is_some_and(|free| free < PRESSURE_RAM);
+    let Some(most) = snapshots_to_keep(idle, pressured) else {
+        return;
+    };
+    let gone = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        trim_pool(&mut pool, most)
+    };
+    drop(gone);
+}
+
+fn snapshots_to_keep(idle: bool, pressured: bool) -> Option<usize> {
+    if idle {
+        Some(0)
+    } else if pressured {
+        Some(POOL_PRESSURED_KEPT)
+    } else {
+        None
+    }
+}
+
+/// Keeps the smallest buffers of `pool`, up to `most` bytes of capacity in
+/// all, and returns the others (largest first) for the caller to free.
+fn trim_pool(pool: &mut Vec<Vec<u8>>, most: usize) -> Vec<Vec<u8>> {
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(8);
-    let (mut seen, mut total) = (0, 0usize);
-    pool.retain(|v| {
-        seen += 1;
+    let mut total = 0usize;
+    let mut keep = 0;
+    for v in pool.iter().rev() {
         total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
-    });
+        if total > most {
+            break;
+        }
+        keep += 1;
+    }
+    let first_kept = pool.len() - keep;
+    let kept = pool.split_off(first_kept);
+    std::mem::replace(pool, kept)
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    fn sizes(pool: &[Vec<u8>]) -> Vec<usize> {
+        pool.iter().map(Vec::capacity).collect()
+    }
+
+    #[test]
+    fn trimming_keeps_the_smallest_up_to_the_limit() {
+        let mut pool: Vec<Vec<u8>> = [8usize, 1, 4, 2]
+            .iter()
+            .map(|&n| Vec::with_capacity(n << 20))
+            .collect();
+        let gone = trim_pool(&mut pool, 7 << 20);
+        assert_eq!(sizes(&pool), [4 << 20, 2 << 20, 1 << 20]);
+        assert_eq!(sizes(&gone), [8 << 20]);
+    }
+
+    #[test]
+    fn trimming_to_nothing_empties_the_pool() {
+        let mut pool: Vec<Vec<u8>> = [3usize, 1]
+            .iter()
+            .map(|&n| Vec::with_capacity(n << 20))
+            .collect();
+        let gone = trim_pool(&mut pool, 0);
+        assert!(pool.is_empty());
+        assert_eq!(sizes(&gone), [3 << 20, 1 << 20]);
+    }
+
+    #[test]
+    fn a_buffer_past_the_limit_goes_even_alone() {
+        let mut pool = vec![Vec::<u8>::with_capacity(600 << 20)];
+        let gone = trim_pool(&mut pool, POOL_PRESSURED_KEPT);
+        assert!(pool.is_empty());
+        assert_eq!(gone.len(), 1);
+    }
+
+    #[test]
+    fn an_idle_pool_goes_and_a_pressed_one_shrinks() {
+        assert_eq!(snapshots_to_keep(true, false), Some(0));
+        assert_eq!(snapshots_to_keep(true, true), Some(0));
+        assert_eq!(snapshots_to_keep(false, true), Some(POOL_PRESSURED_KEPT));
+        assert_eq!(snapshots_to_keep(false, false), None);
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -2195,7 +2317,7 @@ static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[cfg(feature = "diagnostics")]
 pub(crate) fn windows() -> [u64; 3] {
     let asked: u64 = {
-        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         loose
             .values()
             .map(|s| {
@@ -2219,7 +2341,7 @@ pub(crate) fn windows() -> [u64; 3] {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
@@ -2257,10 +2379,13 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    // Before the windows: their table may be empty while the snapshot/exact pools are not.
+    let_go_idle_snapshots();
+    let_go_idle_exact_pool();
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
             return;
         }
@@ -2297,7 +2422,7 @@ pub(crate) fn let_go_idle() {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
     let (windows, window_bytes) = {
-        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         // Each copy once: a window may stand under several keys.
         let mut seen = std::collections::HashSet::new();
         let bytes: u64 = loose
@@ -3592,7 +3717,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
@@ -3621,7 +3746,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     let mut spans: Vec<(u64, u64, bool)> = buffers().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
 }
@@ -3837,7 +3962,7 @@ fn fine() -> bool {
 /// which is copied once for each.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_cover() -> u64 {
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     cover(loose.keys().copied())
 }
 
@@ -3867,13 +3992,141 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
         .min()
 }
 
+/// The most an ask without a length (a root view) is given past its 4 MiB
+/// cell, in bytes: `VICTORY_ROOT_WINDOW_MB` (32; 4 = the cell alone, as
+/// before), in whole cells (`kitty-core/Kitty6` `5d622a1`).
+fn root_window_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let mb = std::env::var("VICTORY_ROOT_WINDOW_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        (mb.unwrap_or(32).clamp(4, 256) << 20) / WINDOW * WINDOW
+    })
+}
+
+/// How long a [`committed_reach`] answer is reused, in milliseconds
+/// (`VICTORY_ROOT_REACH_MS`, 1000; 0: query every time, `kitty-core/Kitty6` `33c5888`).
+fn root_reach_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_ROOT_REACH_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1000)
+    })
+}
+
+/// [`committed_reach`], answered from what was found for the same range in
+/// the last [`root_reach_ms`].
+fn recent_reach(from: u64, limit: u64) -> u64 {
+    type Found = std::collections::HashMap<(u64, u64), (u64, std::time::Instant)>;
+    static FOUND: std::sync::LazyLock<RwLock<Found>> = std::sync::LazyLock::new(Default::default);
+    let ms = root_reach_ms();
+    if ms == 0 {
+        return committed_reach(from, limit);
+    }
+    let fresh = std::time::Duration::from_millis(ms);
+    if let Some(&(reach, at)) = FOUND
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(from, limit))
+        && at.elapsed() < fresh
+    {
+        return reach;
+    }
+    let reach = committed_reach(from, limit);
+    let mut found = FOUND.write().unwrap_or_else(|e| e.into_inner());
+    if found.len() >= 4096 {
+        found.retain(|_, (_, at)| at.elapsed() < fresh);
+    }
+    found.insert((from, limit), (reach, std::time::Instant::now()));
+    reach
+}
+
+/// The window of an ask without a length at `[address, end)`: its 4 MiB
+/// cell, and on past it while the title's memory stays committed, up to
+/// [`root_window_most`]. Prevents AMD DRED page faults when a root view
+/// reads past a single 4 MiB cell into a larger committed allocation.
+fn root_window(address: u64, end: u64) -> (u64, u64) {
+    let (cell, len) = window_of(address, end, WINDOW);
+    let most = root_window_most();
+    if most <= len {
+        return (cell, len);
+    }
+    root_extent(cell, len, recent_reach(cell + len, cell + most), most)
+}
+
+/// The window from `cell` of at least `len` bytes that reaches `reach`,
+/// rounded up to whole cells and held to `most` bytes.
+fn root_extent(cell: u64, len: u64, reach: u64, most: u64) -> (u64, u64) {
+    let end = reach.next_multiple_of(WINDOW).min(cell + most).max(cell + len);
+    (cell, end - cell)
+}
+
+/// Where the title's committed memory that runs on from `from` ends, looked
+/// at no further than `limit` (`from` itself if `from` is not committed).
+fn committed_reach(from: u64, limit: u64) -> u64 {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut at = from;
+    while at < limit {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a query of our own address space into `info`.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.State != MEM_COMMIT || info.RegionSize == 0 {
+            break;
+        }
+        at = info.BaseAddress as u64 + info.RegionSize as u64;
+    }
+    at.min(limit)
+}
+
 /// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (cell, _) = window_of(address, end, WINDOW);
-    let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
+    let named = if unsized_ask && !tails() {
+        root_window(address, end)
+    } else {
+        window_of(address, end, if unsized_ask { WINDOW } else { window() })
+    };
+    // Under the lock, with the handing out: see `let_go_idle`.
+    let note = |shadow: &Shadow| {
+        let now = crate::host::moment();
+        if shadow.used.load(Ordering::Relaxed) != now {
+            shadow.used.store(now, Ordering::Relaxed);
+        }
+        if address < shadow.asked[0].load(Ordering::Relaxed) {
+            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+        }
+        if end > shadow.asked[1].load(Ordering::Relaxed) {
+            shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+        }
+        if unsized_ask {
+            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+    // Fast path under shared read lock (`kitty-core/Kitty6` `42046f5`): all
+    // recording threads look up existing windows concurrently.
+    {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        let key = if unsized_ask && tails() {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            longest_tail(there, address, end)
+        } else if any && fine() && !unsized_ask {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            Some(holder(there, address, end).unwrap_or(named))
+        } else {
+            Some(named)
+        };
+        if let Some(shadow) = key.and_then(|key| map.get(&key)) {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+    }
+    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
@@ -3885,15 +4138,6 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         holder(there, address, end).unwrap_or(named)
     } else {
         named
-    };
-    // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-        }
     };
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
@@ -3949,74 +4193,152 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 #[allow(clippy::type_complexity)]
 static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
 
-/// Since the last frame line: askings for such copies, and copies made.
-static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Since the last frame line: askings for such copies, copies made, and
+/// copies served from recycled buffers (`EXACT_POOL`).
+static EXACT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The asking at which idle exact copies were last scanned.
+static EXACT_LOOKED: AtomicU64 = AtomicU64::new(0);
+
+/// Buffers (and where they are mapped) of exact copies let go of, by bytes,
+/// plus total bytes currently pooled (capped at 64 MiB for 16 GB RAM safety).
+#[allow(clippy::type_complexity)]
+static EXACT_POOL: Mutex<(BTreeMap<u64, Vec<(ID3D12Resource, usize)>>, u64)> =
+    Mutex::new((BTreeMap::new(), 0));
+
+/// Whether buffers of copies of views' own bytes let go of are reused for the
+/// next copy of their size (`VICTORY_EXACT_REUSE`, on by default; `0` disables).
+fn exact_reuse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_REUSE").is_none_or(|v| v != "0"))
+}
+
+/// Releases pooled exact-copy buffers when physical RAM is tight (< 3 GiB).
+fn let_go_idle_exact_pool() {
+    const PRESSURE_RAM: u64 = 3 * (1024 << 20);
+    if crate::host::available_physical_ram().is_some_and(|free| free < PRESSURE_RAM) {
+        let gone = {
+            let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+            pool.1 = 0;
+            std::mem::take(&mut pool.0)
+        };
+        drop(gone);
+    }
+}
 
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
 /// element of the copy its buffer has (`descriptor/host.rs` `own_bytes`).
-/// A host view counts its first element from its buffer's start; a console
-/// view starts at any address, and the title places views at ring
-/// positions inside its big GPU heap. Such a view was refused and its slot
-/// read zeros ("buffer view not on an element of its host copy", in every
-/// run; upstream VIctory 86a5ed6 found its meshlet culling constants and
-/// colour-bake parameter blocks among them and gives each a copy of its
-/// own bytes, as here).
-///
-/// The copy is brought up to date and written back like any other (a list
-/// refreshes the copy its view's slot shows, `buffer_copy`). Kept by
-/// (start, bytes) for as long as a list or a slot holds it; of the others,
-/// those not asked for lately go once there are many (ring positions
-/// change every frame).
+/// Allocates/maps outside the global `EXACT` lock and recycles freed buffers
+/// by size (`kitty-core/Kitty6` `9eb362c`).
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     /// Copies kept before the idle ones are looked for, and the askings an
     /// idle one stays for.
     const MANY: usize = 256;
     const LATELY: u64 = 512;
-    if len == 0 {
+    /// Askings between two looks for idle copies: a look walks every copy.
+    const LOOK_EVERY: u64 = 64;
+    /// Largest single exact view copy allowed, and max pooled RAM bytes.
+    const MOST: u64 = 64 << 20;
+    const MAX_POOL_BYTES: u64 = 64 << 20;
+    if len == 0 || len > MOST || !address.is_multiple_of(4) {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
+    let size = len.next_multiple_of(256);
+    let mut freed = Vec::new();
+    {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let (tick, map) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+            *used = now;
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(shadow.clone());
+        }
+        if map.len() >= MANY && now >= EXACT_LOOKED.load(Ordering::Relaxed) + LOOK_EVERY {
+            EXACT_LOOKED.store(now, Ordering::Relaxed);
+            // Held by the map alone (no list), its buffer by the copy alone (no
+            // slot shows it), and not asked for lately: its buffer is kept for
+            // the next copy of its size (`exact_reuse`).
+            map.retain(|_, (shadow, used)| {
+                let keep = Arc::strong_count(shadow) > 1
+                    || crate::host::references(&shadow.buffer) > 1
+                    || *used + LATELY > now;
+                if !keep {
+                    freed.push(shadow.clone());
+                }
+                keep
+            });
+        }
     }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
+    if exact_reuse() && !freed.is_empty() {
+        let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut held: usize = pool.0.values().map(Vec::len).sum();
+        for shadow in freed.drain(..) {
+            if Arc::strong_count(&shadow) == 1 && shadow.place.is_none() && shadow.card.is_none() {
+                let bytes = shadow.len.next_multiple_of(256);
+                if held < 1024 && pool.1 + bytes <= MAX_POOL_BYTES {
+                    pool.0
+                        .entry(bytes)
+                        .or_default()
+                        .push((shadow.buffer.clone(), shadow.data as usize));
+                    pool.1 += bytes;
+                    held += 1;
+                }
+            }
+        }
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    drop(freed);
+    let reused = if exact_reuse() {
+        let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = pool.0.get_mut(&size).and_then(Vec::pop);
+        if taken.is_some() {
+            pool.1 = pool.1.saturating_sub(size);
+        }
+        taken
+    } else {
+        None
+    };
+    let (buffer, data) = match reused {
+        Some((buffer, data)) => {
+            EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
+            (buffer, data as *mut u8)
+        }
+        None => {
+            let made = host()?.shared_buffer(size)?;
+            EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
+            made
+        }
+    };
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
-    EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
-    Some(shadow)
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    let (tick, map) = &mut *guard;
+    let now = *tick;
+    // Another thread may have made the same copy meanwhile: theirs is kept.
+    let (kept, _) = map.entry((address, len)).or_insert((shadow, now));
+    Some(kept.clone())
 }
 
 /// With the frame line: the buffer views that got a copy of their own
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
 pub(crate) fn exact_line(frames: f64) {
-    let [asked, made] = [0, 1].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
+    let [asked, made, reused] = [0, 1, 2].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
     if asked == 0 {
         return;
     }
     let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_OWN_COPY=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame ({:.1} on buffers used again), {kept} kept",
         asked as f64 / frames,
-        made as f64 / frames
+        made as f64 / frames,
+        reused as f64 / frames
     );
 }
 
@@ -4123,6 +4445,40 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    /// A root view's window reaches as far as the memory around it, in whole
+    /// cells, never less than its cell and never past the cap (`5d622a1`).
+    #[test]
+    fn root_windows_reach_the_committed_memory() {
+        use super::root_extent;
+        let cell = 0xcae4_00000u64;
+        let most = 32 << 20;
+        assert_eq!(root_extent(cell, WINDOW, cell + WINDOW, most), (cell, WINDOW));
+        assert_eq!(root_extent(cell, WINDOW, cell + 0xbfd000 + 1, most), (cell, 12 << 20));
+        assert_eq!(root_extent(cell, WINDOW, cell + (12 << 20) + 1, most), (cell, 16 << 20));
+        assert_eq!(root_extent(cell, WINDOW, cell + (1 << 30), most), (cell, most));
+        assert_eq!(root_extent(cell, 2 * WINDOW, cell + WINDOW, most), (cell, 2 * WINDOW));
+    }
+
+    /// The reach of committed memory stops where the commitment does.
+    #[test]
+    fn committed_reach_stops_at_the_end_of_committed_memory() {
+        use super::committed_reach;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: a fresh reservation of our own, freed below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 16 << 20, MEM_RESERVE, PAGE_READWRITE) } as u64;
+        assert_ne!(base, 0);
+        // SAFETY: inside the reservation just made.
+        let done = unsafe { VirtualAlloc(base as *const _, 12 << 20, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!done.is_null());
+        assert_eq!(committed_reach(base, base + (16 << 20)), base + (12 << 20));
+        assert_eq!(committed_reach(base, base + (8 << 20)), base + (8 << 20));
+        assert_eq!(committed_reach(base + (12 << 20), base + (16 << 20)), base + (12 << 20));
+        // SAFETY: our own reservation, nothing else uses it.
+        assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0);
     }
 }
 
@@ -4232,7 +4588,7 @@ pub(crate) fn near(va: u64) -> String {
         .collect();
     all.extend(
         LOOSE
-            .lock()
+            .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|s| (s.gpu, s.start, s.len)),

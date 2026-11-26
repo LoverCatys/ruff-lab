@@ -2202,6 +2202,9 @@ struct Deferred {
     filled: std::collections::HashMap<(usize, usize), u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Last card-written source copied into each aliased host texture in this
+    /// list (`crate::texture::alias`, fxceless 19a45d1 / `kitty-core/Kitty6` `cd537b7`).
+    texture_aliases: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -4651,7 +4654,9 @@ impl Host {
                     if let Some(card) = flight.card {
                         self.card_done(card);
                     }
-                    landed.push((flight.lists, flight.order));
+                    let mut lists = flight.lists;
+                    crate::list::tables_early(&mut lists);
+                    landed.push((lists, flight.order));
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                 Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
@@ -5055,7 +5060,9 @@ impl Host {
                         if let Some(card) = flight.card {
                             self.card_done(card);
                         }
-                        landed.push((flight.lists, flight.order));
+                        let mut lists = flight.lists;
+                        crate::list::tables_early(&mut lists);
+                        landed.push((lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                     Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
@@ -6455,6 +6462,18 @@ impl HostList {
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    /// Whether `source` is not the last card-written texture copied into the
+    /// aliased host texture `view` in this list (and notes it as that now).
+    pub(crate) fn alias_source_changed(
+        &self,
+        view: &ID3D12Resource,
+        source: &ID3D12Resource,
+    ) -> bool {
+        let view = view.as_raw() as usize;
+        let source = source.as_raw() as usize;
+        self.deferred().texture_aliases.insert(view, source) != Some(source)
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
