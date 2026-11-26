@@ -608,6 +608,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.host_targets = None;
     }
 
     pub(crate) fn reset(&mut self, pipeline: This) {

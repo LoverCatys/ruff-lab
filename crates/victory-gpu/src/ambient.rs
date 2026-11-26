@@ -115,8 +115,10 @@ pub(crate) fn sky_drawn(image: usize) {
     }
 }
 
-/// The light follows the sky dome by default (`VICTORY_AMBIENT_SKY=off` keeps
-/// the constant; `gain,least,power` overrides `[0.36, 0.05, 0.4]`).
+/// Sky-dome-following ambient (`VICTORY_AMBIENT_SKY=1` or `gain,least,power`).
+/// Opt-in: in indoor scenes facing a dawn window (e.g. opening cell), the sky
+/// dome mean drops indoor ambient to ~0.08, crushing characters to silhouettes
+/// and blowing out auto-exposure; default stays constant `VICTORY_AMBIENT` (0.6).
 static FOLLOW: std::sync::Mutex<Option<Option<[f32; 3]>>> = std::sync::Mutex::new(None);
 
 fn follow() -> Option<[f32; 3]> {
@@ -125,14 +127,19 @@ fn follow() -> Option<[f32; 3]> {
     }
     static SET: OnceLock<Option<[f32; 3]>> = OnceLock::new();
     *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_SKY").unwrap_or_default();
-        if set.trim() == "off" {
+        let Ok(set) = std::env::var("VICTORY_AMBIENT_SKY") else {
+            return None;
+        };
+        let trimmed = set.trim();
+        if trimmed.is_empty() || trimmed == "0" || trimmed == "off" {
             return None;
         }
         let mut follow = [0.36, 0.05, 0.4];
-        for (to, v) in follow.iter_mut().zip(set.split(',')) {
-            if let Ok(v) = v.trim().parse() {
-                *to = v;
+        if trimmed != "1" && trimmed != "on" {
+            for (to, v) in follow.iter_mut().zip(trimmed.split(',')) {
+                if let Ok(v) = v.trim().parse() {
+                    *to = v;
+                }
             }
         }
         Some(follow)
