@@ -71,8 +71,54 @@ pub(crate) struct Shader {
     /// ([`crate::ambient::REFLECTED`]).
     #[cfg(windows)]
     pub(crate) ends_reflections: bool,
+    /// Ray-tracing pass or ray-request feeder skipped when hardware RT is off
+    /// (`VICTORY_SKIP_RT`, on by default; `0` to disable). Skipping these also
+    /// prevents RT-only host textures/UAVs from being allocated on 8 GB VRAM.
+    #[cfg(windows)]
+    skip_rt: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+}
+
+/// Ray-tracing shaders and ray-request feeder programs that waste GPU time and
+/// allocate RT-only textures when hardware ray tracing is not running.
+/// Combines `Belobug` (`6986a5714a`) and `voidopcode/vilocity` (`2681546144`).
+#[cfg(windows)]
+const RT_SKIP_PATTERNS: &[&[u8]] = &[
+    b"CS_ScreenProbes_ActivateRays",
+    b"CS_ScreenProbes_EvaluateRayRequests",
+    b"CS_SortRayTiles",
+    b"CS_Primary_RegisterAllocationRequests",
+    b"TraceRays_BVH",
+    b"RTShadowTrace",
+    b"RTDistantShadowTrace",
+    b"RTDistantLODLightShadow",
+    b"TraceShadowRays",
+    b"RaytraceShadows",
+    b"RaytraceVBuffer",
+    b"IrradianceCache_ShadowTrace",
+    b"ShadowRaytracing",
+    b"CollisionRaytraced",
+    b"PPR_Raytrace",
+];
+
+#[cfg(windows)]
+fn skip_rt_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_SKIP_RT").is_none_or(|v| v != "0");
+        if on {
+            tracing::info!("VICTORY_SKIP_RT=1: skipping unused ray-tracing passes and their texture allocations");
+        }
+        on
+    })
+}
+
+#[cfg(windows)]
+fn matches_rt_skip(bytes: &[u8]) -> bool {
+    RT_SKIP_PATTERNS
+        .iter()
+        .any(|pat| bytes.windows(pat.len()).any(|w| w == *pat))
 }
 
 impl std::fmt::Debug for Shader {
@@ -141,6 +187,8 @@ impl Shader {
                 .windows(crate::ambient::REFLECTED.len())
                 .any(|w| w == crate::ambient::REFLECTED),
             #[cfg(windows)]
+            skip_rt: skip_rt_enabled() && matches_rt_skip(bytes),
+            #[cfg(windows)]
             translated: OnceLock::new(),
         }
     }
@@ -151,6 +199,7 @@ impl Shader {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    pub(crate) tables: crate::draw::TablePlan,
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
@@ -222,7 +271,8 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+    Ok(Translated { host, used, tables, stores })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -469,7 +519,7 @@ fn skipped_shader(shaders: &[Arc<Shader>]) -> Option<&str> {
     }
     shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| shader.skip_rt || hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
 }
 

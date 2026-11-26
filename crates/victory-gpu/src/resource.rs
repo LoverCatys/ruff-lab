@@ -1328,12 +1328,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         const TEXTURE_2D: u32 = 3;
         let mut tiled = None;
         let mut texture = None;
+        let planned_drop = drop_levels(&r.desc, r.host.placed.load(Relaxed), clear.is_null());
         let shape_fits = fills(&r.desc)
             && r.desc.dimension == TEXTURE_2D
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
-        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
+        if planned_drop == 0 && shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
             // What the upload can read: a console layout, no XOR mode
@@ -1360,7 +1361,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         let texture = match texture {
             Some(texture) => Some(texture),
             None => {
-                dropped = drop_levels(&r.desc);
+                dropped = planned_drop;
                 let mut desc = r.desc;
                 if dropped > 0 {
                     desc.width >>= dropped;
@@ -1522,6 +1523,44 @@ pub(crate) fn room_for_short() -> bool {
     }
 }
 
+/// The largest side, in texels, of a sampled placed BC texture on the host
+/// (`VICTORY_TEXTURE_MAX_DIM`, 4..=16384; unset or 0: off).
+/// Adapted from PastiiJay/klbf-lab (`fccf50f` / `52f2384`, GPL-3.0-or-later).
+#[cfg(windows)]
+fn texture_max_dim() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let value = std::env::var("VICTORY_TEXTURE_MAX_DIM").ok()?;
+        match value.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n @ 4..=16384) => {
+                tracing::info!(max_dim = n, "VICTORY_TEXTURE_MAX_DIM: capping sampled placed BC textures");
+                Some(n)
+            }
+            _ => {
+                tracing::warn!(value, "VICTORY_TEXTURE_MAX_DIM expects 0 or a size from 4 to 16384");
+                None
+            }
+        }
+    })
+}
+
+/// Whether flat UI / loading screens keep their full size under
+/// `VICTORY_TEXTURE_MAX_DIM` (`VICTORY_TEXTURE_MAX_DIM_KEEP_UI`, on by default; 0: off).
+#[cfg(windows)]
+fn keep_ui() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_MAX_DIM_KEEP_UI").is_none_or(|v| v != "0"))
+}
+
+/// Flat screen images (loading screens, menus): non-power-of-two sides or a
+/// short mip chain (<= 3 levels, or 3+ fewer than a full chain down to the smaller side).
+fn looks_like_ui(desc: &ResourceDesc) -> bool {
+    let (w, h) = (desc.width, u64::from(desc.height));
+    let full = u64::from(64 - w.min(h).max(1).leading_zeros());
+    !w.is_power_of_two() || !h.is_power_of_two() || desc.mip_levels <= 3 || u64::from(desc.mip_levels) + 2 < full
+}
+
 #[cfg(windows)]
 fn short_side() -> u64 {
     static SIDE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1534,10 +1573,11 @@ fn short_side() -> u64 {
 }
 
 /// How many largest mips to omit for a title-filled 2D single-slice texture:
-/// respects `VICTORY_TEXTURE_DROP_MIPS` (0..=4 on >=512 px textures) and
-/// `ShortOfRoom` (`short_side()`, default 256 px).
+/// respects `VICTORY_TEXTURE_DROP_MIPS` (0..=4 on >=512 px textures),
+/// `VICTORY_TEXTURE_MAX_DIM` (on placed BC textures, preserving UI via `keep_ui`),
+/// and `ShortOfRoom` (`short_side()`, default 256 px).
 #[cfg(windows)]
-fn drop_levels(desc: &ResourceDesc) -> u32 {
+fn drop_levels(desc: &ResourceDesc, placed: bool, clear_null: bool) -> u32 {
     const TEXTURE_2D: u32 = 3;
     static ALWAYS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let always = *ALWAYS.get_or_init(|| {
@@ -1557,6 +1597,17 @@ fn drop_levels(desc: &ResourceDesc) -> u32 {
         return 0;
     }
     let mut n = if always > 0 && width.min(height) >= 512 { always } else { 0 };
+    if placed
+        && clear_null
+        && desc.flags & 0xf == 0
+        && element(desc.format).is_some_and(|(_, block)| block == 4)
+        && let Some(max_dim) = texture_max_dim()
+        && !(keep_ui() && looks_like_ui(desc))
+    {
+        while width.max(height) >> n > max_dim {
+            n += 1;
+        }
+    }
     if SHORT.get() {
         let side = short_side();
         while width.max(height) >> n > side {
@@ -2017,19 +2068,54 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let mut idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let video = crate::host::host().and_then(|h| h.video_memory());
+    let mut idle_ms = crate::host::vram_idle_ms(video);
     if commit_short(100) {
         idle_ms = idle_ms.min(1_000);
     }
+    // `VICTORY_TEXTURE_LRU=1` (from PastiiJay/klbf-lab `0ea9755`, after
+    // AKA0GHOST/victory-fork e3aa169 & 7daa701): evict oldest idle copies
+    // first, stopping once video memory drops under `VICTORY_TEXTURE_KEEP_PERCENT`
+    // (default `room_percent - 5`), while still letting go copies idle for 30 s.
+    const LONG_MS: u64 = 30_000;
+    static LRU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let lru = *LRU.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LRU").is_some_and(|v| v == "1"));
+    static KEEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let keep = *KEEP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_KEEP_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(room_percent().saturating_sub(5), |p| p.clamp(40, room_percent()))
+    });
+    let mut over = match video {
+        Some([budget, used, ..]) if lru && !commit_short(100) => {
+            used.saturating_sub(budget / 100 * keep)
+        }
+        _ => u64::MAX,
+    };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    for &at in all.iter() {
+    let mut order: Vec<(u64, usize)> = all
+        .iter()
+        .map(|&at| {
+            // SAFETY: as below.
+            let r = unsafe { &*(at as *const Resource) };
+            (r.host.used.load(Relaxed), at)
+        })
+        .collect();
+    if lru {
+        order.sort_unstable_by_key(|&(used, _)| used);
+    }
+    for &(_, at) in order.iter() {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
         if !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        if over == 0 && !crate::host::long_ago(r.host.used.load(Relaxed), LONG_MS, IDLE_FRAMES) {
             continue;
         }
         let gone = {
@@ -2054,6 +2140,7 @@ pub(crate) fn let_go_idle() {
             KINDS[3].fetch_add(host.bytes, Relaxed);
             went += 1;
             bytes += host.bytes;
+            over = over.saturating_sub(host.bytes);
             if first.is_none() {
                 first = Some(at);
             }
@@ -4434,5 +4521,30 @@ float4 lit() : SV_Target { return 1.0; }
         let (mut first, mut levels, mut clamp) = (1, 4, 1.0);
         shift_levels(2, &mut first, &mut levels, &mut clamp);
         assert_eq!((first, levels, clamp), (0, 3, 0.0));
+    }
+
+    #[test]
+    fn ui_guess_keeps_screen_and_short_chain_textures_full_size() {
+        let tex = |width, height, mip_levels| ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width,
+            height,
+            depth_or_array_size: 1,
+            mip_levels,
+            format: 98,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        };
+        assert!(looks_like_ui(&tex(1920, 1080, 11)));
+        assert!(looks_like_ui(&tex(1280, 720, 1)));
+        assert!(looks_like_ui(&tex(2048, 1024, 1)));
+        assert!(looks_like_ui(&tex(4096, 2048, 3)));
+        assert!(looks_like_ui(&tex(2048, 2048, 6)));
+        assert!(!looks_like_ui(&tex(1024, 512, 10)));
+        assert!(!looks_like_ui(&tex(2048, 2048, 12)));
+        assert!(!looks_like_ui(&tex(4096, 2048, 10)));
     }
 }
