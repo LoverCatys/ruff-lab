@@ -1137,6 +1137,9 @@ pub(crate) struct HostTexture {
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
     pub(crate) tiled: Option<crate::tiles::Tiled>,
+    /// The title's largest mips it leaves out ([`drop_levels`]): its mip
+    /// `m` is the title's `m + dropped`.
+    pub(crate) dropped: u32,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1353,9 +1356,19 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 texture = reserved;
             }
         }
+        let mut dropped = 0u32;
         let texture = match texture {
             Some(texture) => Some(texture),
-            None => host_texture(&r.desc, r.host.state, clear, r.data() as usize),
+            None => {
+                dropped = drop_levels(&r.desc);
+                let mut desc = r.desc;
+                if dropped > 0 {
+                    desc.width >>= dropped;
+                    desc.height >>= dropped;
+                    desc.mip_levels -= dropped as u16;
+                }
+                host_texture(&desc, r.host.state, clear, r.data() as usize)
+            }
         };
         let Some(texture) = texture else {
             r.host.refused.store(true, Relaxed);
@@ -1378,6 +1391,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             Some(tiled) => HostTexture::new_tiled(texture, state, tiled),
             None => HostTexture::new(texture, state),
         };
+        host.dropped = dropped;
         host.filled = fills(&r.desc);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
@@ -1450,6 +1464,141 @@ pub(crate) fn room() -> bool {
         }
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// Host copies made on this thread now omit mips larger than `short_side()`.
+    static SHORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While alive, host copies of title-filled 2D textures omit mips larger than
+/// `short_side()` (default 256 px, ~87 KB per BC7 texture) instead of being
+/// refused and rendering black on 8 GB GPUs.
+/// Adapted from ka1qux/BRVIctory-ka1qux (after Belobug ebd990d & victory-fork#610).
+#[cfg(windows)]
+pub(crate) struct ShortOfRoom(());
+
+#[cfg(windows)]
+impl ShortOfRoom {
+    pub(crate) fn begin() -> ShortOfRoom {
+        SHORT.set(true);
+        ShortOfRoom(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ShortOfRoom {
+    fn drop(&mut self) {
+        SHORT.set(false);
+    }
+}
+
+/// Whether short (mip-dropped) host copies can still be made while the card has
+/// no room for full-res textures: up to 97% of DXGI budget (`VICTORY_TEXTURE_SHORT=0`
+/// disables; `VICTORY_TEXTURE_SHORT_PERCENT` overrides).
+#[cfg(windows)]
+pub(crate) fn room_for_short() -> bool {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let percent = *PERCENT.get_or_init(|| {
+        if std::env::var_os("VICTORY_TEXTURE_SHORT").is_some_and(|v| v == "0")
+            || std::env::var_os("VICTORY_TEXTURE_BUDGET_MB").is_some()
+        {
+            return 0;
+        }
+        std::env::var("VICTORY_TEXTURE_SHORT_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(97u64.max(room_percent()), |p| p.clamp(room_percent(), 98))
+    });
+    if percent == 0 || commit_short(50) {
+        return false;
+    }
+    match crate::host::host().and_then(|h| h.video_memory()) {
+        Some([budget, used, ..]) => {
+            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * percent
+        }
+        None => false,
+    }
+}
+
+#[cfg(windows)]
+fn short_side() -> u64 {
+    static SIDE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SIDE.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_SHORT_SIDE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(256, |side| side.clamp(16, 4096))
+    })
+}
+
+/// How many largest mips to omit for a title-filled 2D single-slice texture:
+/// respects `VICTORY_TEXTURE_DROP_MIPS` (0..=4 on >=512 px textures) and
+/// `ShortOfRoom` (`short_side()`, default 256 px).
+#[cfg(windows)]
+fn drop_levels(desc: &ResourceDesc) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    static ALWAYS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let always = *ALWAYS.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_DROP_MIPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(4)
+    });
+    let (width, height) = (desc.width, u64::from(desc.height));
+    if !fills(desc)
+        || desc.dimension != TEXTURE_2D
+        || desc.depth_or_array_size != 1
+        || desc.sample_count > 1
+        || desc.mip_levels < 2
+    {
+        return 0;
+    }
+    let mut n = if always > 0 && width.min(height) >= 512 { always } else { 0 };
+    if SHORT.get() {
+        let side = short_side();
+        while width.max(height) >> n > side {
+            n += 1;
+        }
+    }
+    levels_to_drop(n, width, height, u32::from(desc.mip_levels))
+}
+
+fn levels_to_drop(wanted: u32, width: u64, height: u64, mips: u32) -> u32 {
+    let mut n = wanted.min(mips.saturating_sub(1));
+    while n > 0 && !(width.is_multiple_of(4 << n) && height.is_multiple_of(4 << n)) {
+        n -= 1;
+    }
+    n
+}
+
+/// Number of largest title mips omitted by the host copy of `this`.
+#[cfg(windows)]
+pub(crate) fn dropped(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return 0;
+    }
+    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    made.as_ref().map_or(0, |(host, _)| host.dropped)
+}
+
+/// Adjusts a shader view's mip range when the host texture omits `dropped` largest mips.
+pub(crate) fn shift_levels(dropped: u32, first: &mut u32, levels: &mut u32, clamp: &mut f32) {
+    if dropped == 0 {
+        return;
+    }
+    if *levels != u32::MAX {
+        let end = first.saturating_add(*levels);
+        *levels = end.saturating_sub(dropped.max(*first)).max(1);
+    }
+    *first = first.saturating_sub(dropped);
+    *clamp = (*clamp - dropped as f32).max(0.0);
 }
 
 /// The PC's commit the texture queue leaves free, in bytes:
@@ -2067,6 +2216,7 @@ impl HostTexture {
             bytes,
             filled: false,
             tiled: None,
+            dropped: 0,
         }
     }
 
@@ -2084,6 +2234,7 @@ impl HostTexture {
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
+            dropped: 0,
         }
     }
 }
@@ -4270,5 +4421,18 @@ float4 lit() : SV_Target { return 1.0; }
         assert!(short_of_commit(2 * gb, 6 * gb, 50));
         assert!(!short_of_commit(2 * gb, 6 * gb, 25));
         assert!(short_of_commit(gb, 6 * gb, 25));
+    }
+
+    #[test]
+    fn levels_to_drop_and_shift_levels_keep_block_alignment() {
+        assert_eq!(levels_to_drop(3, 2048, 2048, 12), 3);
+        assert_eq!(levels_to_drop(10, 64, 64, 7), 4); // 64 / (4 << 4) == 1
+        assert_eq!(levels_to_drop(2, 1024, 1024, 1), 0); // at least 1 mip left
+        let (mut first, mut levels, mut clamp) = (0, u32::MAX, 2.5);
+        shift_levels(2, &mut first, &mut levels, &mut clamp);
+        assert_eq!((first, levels, clamp), (0, u32::MAX, 0.5));
+        let (mut first, mut levels, mut clamp) = (1, 4, 1.0);
+        shift_levels(2, &mut first, &mut levels, &mut clamp);
+        assert_eq!((first, levels, clamp), (0, 3, 0.0));
     }
 }
