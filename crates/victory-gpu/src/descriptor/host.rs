@@ -178,7 +178,12 @@ impl Queued {
 #[repr(align(64))]
 struct StripeLock<T>(Mutex<T>);
 
+/// Each host heap's unique identity so dynamic slots are never released into a
+/// newer heap allocated at the same address (`kitty-core/Kitty6` `aca0877`).
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -1315,6 +1320,7 @@ impl HostHeap {
         let queued = std::sync::Arc::new(Queued::new(if sampler { 0 } else { count }));
         let tracked_slots = if sampler { 0 } else { count as usize };
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -1496,6 +1502,11 @@ impl HostHeap {
         GIVEN[0].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
+    }
+
+    /// This heap's unique identity (`NEXT_ID`).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -2179,10 +2190,13 @@ impl HostHeap {
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), only if `id` matches [`HostHeap::id`].
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
@@ -4374,9 +4388,26 @@ mod tests {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        let Some(a) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some(b) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert_ne!(a.id(), b.id());
+        let first = a.dynamic(2).expect("two dynamic slots");
+        let free = a.free.load(Ordering::Relaxed);
+        a.release(b.id(), first, 2);
+        assert_eq!(a.free.load(Ordering::Relaxed), free);
+        a.release(a.id(), first, 2);
+        assert_eq!(a.free.load(Ordering::Relaxed), free + 2);
     }
 
     /// Backing buffer and descriptor memory helper for concurrency stress tests

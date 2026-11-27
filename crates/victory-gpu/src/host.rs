@@ -2230,6 +2230,9 @@ struct Deferred {
     /// Title textures of the kinds copied back ([`crate::texback`]) that
     /// the list's shaders write, copied when the list closes.
     back_wanted: Vec<usize>,
+    /// Title textures whose upload the list copies from what the card detiles
+    /// in its prelude (`crate::gpudetile`), in recorded order.
+    detiles: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// Those copies, whose texels go to title memory once the list has run.
     texture_backs: Vec<crate::texback::Back>,
     /// Whether a step zeroes the indirect-work budget.
@@ -3161,7 +3164,7 @@ fn relay_worker() {
 fn relay_hand_back(back: &[Declared]) {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
-        if shadow.carded() {
+        if shadow.carded() || shadow.in_place() {
             continue;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -3462,7 +3465,7 @@ fn hand_back(back: &[Declared]) {
         // threads), then the merges, in order, as below.
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for (shadow, declared) in back {
-            if shadow.carded() {
+            if shadow.carded() || shadow.in_place() {
                 continue;
             }
             let mut sorted = declared.clone();
@@ -3493,8 +3496,8 @@ fn hand_back(back: &[Declared]) {
         return;
     }
     for (shadow, declared) in back {
-        if shadow.carded() {
-            // Done before (`Host::card_back`).
+        if shadow.carded() || shadow.in_place() {
+            // Done before (`Host::card_back`), or nothing to do (in place).
             shadow.copy_back_done(declared);
             continue;
         }
@@ -5230,7 +5233,7 @@ impl Host {
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(this_submission) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -6075,7 +6078,8 @@ impl HostList {
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    fn prelude(&self, submission: u64) -> Option<ID3D12CommandList> {
+        let detiles: Vec<_> = self.deferred().detiles.clone();
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -6144,7 +6148,7 @@ impl HostList {
                 .firsts()
                 .map(|(b, first)| transition(b, D3D12_RESOURCE_STATE_COMMON, host_state(first))),
         );
-        if barriers.is_empty() && syncs.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && detiles.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -6167,6 +6171,9 @@ impl HostList {
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
+                }
+                for staging in &detiles {
+                    staging.record_detile(list, submission);
                 }
                 list.Close()
             })
@@ -6535,6 +6542,12 @@ impl HostList {
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
         self.deferred().copies.push(Step::Texture(staging));
+    }
+
+    /// Records a texture whose upload copies from a GPU-detiled linear buffer
+    /// so the list's prelude dispatches the detile shader before the list runs.
+    pub(crate) fn detile_first(&self, staging: std::sync::Arc<crate::texture::Staging>) {
+        self.deferred().detiles.push(staging);
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -7557,16 +7570,40 @@ impl Meter {
             }
             {
                 let mode = crate::watch::page_writes();
-                let [writes, bytes, guarded, plain] = [0, 1, 2, 3].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
+                let [writes, bytes, guarded, plain, told] =
+                    [0, 1, 2, 3, 4].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
                 let [kept, dropped, slots, uploaded] =
                     [0, 1, 2, 3].map(|i| crate::descriptor::host::PAGE_WRITES[i].load(Ordering::Relaxed));
                 tracing::info!(
-                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({dropped} dropped);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({})                      (VICTORY_PAGE_WRITES: unset or guards opens the guarded blocks, 0 counts only, 1, slots, all)",
+                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to plain addresses finished ({}; {told} passed to the texture pass); {kept} ranges under texture views kept for the texture pass ({dropped} dropped); {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({}) (VICTORY_PAGE_WRITES: unset = guards+slots+plain textures; guards, 0, 1, slots, all)",
                     bytes >> 20,
                     if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
-                    if mode & 4 != 0 { "told as well" } else { "counted only" },
+                    if mode & 4 != 0 { "told as well" } else if mode & 8 != 0 { "textures told" } else { "counted only" },
                     if mode & 2 != 0 { "made due again" } else { "left as they were" }
                 );
+                let [cpu_us, cpu_bytes, cpu_textures] =
+                    [0, 1, 2].map(|i| crate::texture::DETILED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                let [card_textures, card_dispatches, card_bytes, card_us, card_made, card_refused] =
+                    std::array::from_fn::<f64, 6, _>(|i| crate::gpudetile::STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                let modes: Vec<String> = crate::texture::BY_MODE
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(mode, bytes)| {
+                        let mb = bytes.swap(0, Ordering::Relaxed) as f64 / frames / 1e6;
+                        (mb >= 0.05).then(|| format!("{} {mb:.1}", victory_formats::texture::Swizzle(mode as u32).name()))
+                    })
+                    .collect();
+                if cpu_bytes + card_bytes > 0.0 {
+                    tracing::info!(
+                        "texture detiling per frame: on the PC {:.2} ms for {:.1} MB ({cpu_textures:.1} textures); on the card (VICTORY_GPU_DETILE={}) {card_textures:.1} textures in {card_dispatches:.0} dispatches, copying {:.1} MB in {:.2} ms, {card_made:.1} stagings made, {card_refused:.1} refused; MB by swizzle: {}",
+                        cpu_us / 1e3,
+                        cpu_bytes / 1e6,
+                        std::env::var("VICTORY_GPU_DETILE").unwrap_or_else(|_| "1".into()),
+                        card_bytes / 1e6,
+                        card_us / 1e3,
+                        modes.join(", ")
+                    );
+                }
             }
             #[cfg(feature = "diagnostics")]
             tracing::info!(

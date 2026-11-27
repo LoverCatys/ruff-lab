@@ -30,6 +30,77 @@ macro_rules! once {
     }};
 }
 
+/// Backing D3D12 buffers of a [`Staging`] while live (released by
+/// [`let_go_idle`] once unchanged for 2 s / 30 frames to keep 16 GB RAM and
+/// 8 GB VRAM lean).
+struct StagingMem {
+    buffer: ID3D12Resource,
+    data: usize,
+    /// Device-local linear buffer populated by `gpudetile` when GPU detiling is
+    /// active (`(resource, pooled_size)`; `0` = not pooled).
+    linear: Option<(ID3D12Resource, u64)>,
+}
+
+impl Drop for StagingMem {
+    fn drop(&mut self) {
+        if let Some((linear, pooled)) = self.linear.take()
+            && pooled != 0
+        {
+            let mut all = SPARE_LINEAR.lock().unwrap_or_else(|e| e.into_inner());
+            if all.1 + pooled <= LINEAR_POOL_MAX {
+                all.1 += pooled;
+                all.0.entry(pooled).or_default().push(SpareLinear(linear));
+            }
+        }
+    }
+}
+
+/// Immutable plan for detiling a texture on the GPU (`VICTORY_GPU_DETILE`).
+struct GpuPlan {
+    raw: crate::gpudetile::Raw,
+    jobs: Vec<crate::gpudetile::Job>,
+    total: u64,
+    recorded: std::sync::atomic::AtomicU64,
+}
+
+/// Bounded pool of idle device-local linear detile buffers (capped at 64 MiB
+/// for 8 GB VRAM GPUs; individual buffers > 16 MiB are released directly).
+const LINEAR_POOL_MAX: u64 = 64 << 20;
+const LINEAR_POOL_SINGLE_MAX: u64 = 16 << 20;
+
+static SPARE_LINEAR: Mutex<(std::collections::BTreeMap<u64, Vec<SpareLinear>>, u64)> =
+    Mutex::new((std::collections::BTreeMap::new(), 0));
+
+struct SpareLinear(ID3D12Resource);
+// SAFETY: a device-local D3D12 resource is free-threaded.
+unsafe impl Send for SpareLinear {}
+
+fn linear_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, u64)> {
+    let size = total.max(64 << 10).next_power_of_two();
+    if size > LINEAR_POOL_SINGLE_MAX {
+        return host.uav_buffer(total).map(|b| (b, 0));
+    }
+    let spare = {
+        let mut all = SPARE_LINEAR.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = all.0.get_mut(&size).and_then(Vec::pop);
+        if taken.is_some() {
+            all.1 -= size;
+        }
+        taken
+    };
+    match spare {
+        Some(SpareLinear(buffer)) => Some((buffer, size)),
+        None => host.uav_buffer(size).map(|b| (b, size)),
+    }
+}
+
+/// Diagnostics since the last frame-rate line: CPU detile `(us, bytes, textures)`.
+pub(crate) static DETILED: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Diagnostics since the last frame-rate line: detiled bytes by swizzle mode.
+pub(crate) static BY_MODE: [std::sync::atomic::AtomicU64; 28] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 28];
+
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
@@ -39,7 +110,12 @@ pub(crate) struct Staging {
     /// records an upload from it. Its contents are only needed between a
     /// detiling and the upload that copies it: unchanged textures are told
     /// by the hash and the write watch in `last`, not by these bytes.
-    mem: Mutex<Option<(ID3D12Resource, usize)>>,
+    mem: Mutex<Option<StagingMem>>,
+    /// True whenever `mem` was freshly allocated and has not been filled by
+    /// `detile` yet (prevents an unchanged-hash fast path from uploading zeros).
+    needs_fill: std::sync::atomic::AtomicBool,
+    /// GPU detiling plan when `VICTORY_GPU_DETILE` accepts this texture.
+    gpu: Option<GpuPlan>,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     size: u64,
@@ -698,7 +774,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset (it is let go only while
     // no list holds the staging).
-    let Some((buffer, _)) = staging.buffer() else {
+    let Some(buffer) = staging.copy_source() else {
         return;
     };
     crate::list::ensure_state(list, resource, COPY_DEST);
@@ -748,6 +824,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         };
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+    if staging.gpu.is_some() {
+        list.detile_first(staging.clone());
     }
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
@@ -898,23 +977,69 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
 }
 
 impl Staging {
-    /// The staging buffer and its mapping, made anew if it was let go.
-    fn buffer(&self) -> Option<(ID3D12Resource, usize)> {
+    /// The buffer the list copies subresources from: the GPU-detiled linear
+    /// buffer when `VICTORY_GPU_DETILE` is active, else the CPU staging buffer.
+    fn copy_source(&self) -> Option<ID3D12Resource> {
         let mut mem = self.mem.lock().unwrap_or_else(|e| e.into_inner());
-        let data = self.mapped(&mut mem)?;
-        mem.as_ref().map(|(buffer, _)| (buffer.clone(), data))
+        self.ensure_mem(&mut mem)?;
+        let m = mem.as_ref()?;
+        Some(m.linear.as_ref().map_or_else(|| m.buffer.clone(), |(l, _)| l.clone()))
     }
 
-    /// Where `mem`'s buffer is mapped, making one if there is none.
-    fn mapped(&self, mem: &mut Option<(ID3D12Resource, usize)>) -> Option<usize> {
+    /// Records the GPU detiling compute dispatches in the list's prelude once
+    /// per submission (`VICTORY_GPU_DETILE`).
+    pub(crate) fn record_detile(&self, list: &ID3D12GraphicsCommandList, submission: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (Some(gpu), Some(detiler)) = (&self.gpu, crate::gpudetile::detiler()) else {
+            return false;
+        };
+        if gpu.recorded.swap(submission, Relaxed) == submission {
+            return false;
+        }
+        let (raw, linear) = {
+            let mut mem = self.mem.lock().unwrap_or_else(|e| e.into_inner());
+            if self.ensure_mem(&mut mem).is_none() {
+                return false;
+            }
+            let Some(m) = mem.as_ref() else {
+                return false;
+            };
+            let Some((linear, _)) = &m.linear else {
+                return false;
+            };
+            (m.buffer.clone(), linear.clone())
+        };
+        crate::gpudetile::record(list, detiler, &raw, &linear, &gpu.jobs);
+        crate::gpudetile::STATS[0].fetch_add(1, Relaxed);
+        crate::gpudetile::STATS[1].fetch_add(gpu.jobs.len() as u64, Relaxed);
+        true
+    }
+
+    /// Ensures `mem` holds live buffer(s), returning the mapped upload pointer.
+    fn ensure_mem(&self, mem: &mut Option<StagingMem>) -> Option<usize> {
         if mem.is_none() {
-            let (buffer, data) = host()?.upload_buffer(self.bytes)?;
+            let host = host()?;
+            let upload_bytes = self.gpu.as_ref().map_or(self.bytes, |g| g.raw.bytes);
+            let (buffer, data) = host.upload_buffer(upload_bytes)?;
+            let linear = if let Some(gpu) = &self.gpu {
+                let linear = linear_buffer(host, gpu.total)?;
+                // SAFETY: freshly allocated upload buffer of `gpu.raw.bytes`.
+                unsafe { crate::gpudetile::write_tables(&self.layout, &gpu.raw, data) };
+                Some(linear)
+            } else {
+                None
+            };
             crate::host::name(&buffer, || format!("staging of {:?} again", self.memory));
             REMADE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            REMADE[1].fetch_add(self.bytes, std::sync::atomic::Ordering::Relaxed);
-            *mem = Some((buffer, data as usize));
+            REMADE[1].fetch_add(upload_bytes, std::sync::atomic::Ordering::Relaxed);
+            self.needs_fill.store(true, std::sync::atomic::Ordering::Relaxed);
+            *mem = Some(StagingMem {
+                buffer,
+                data: data as usize,
+                linear,
+            });
         }
-        mem.as_ref().map(|&(_, data)| data)
+        mem.as_ref().map(|m| m.data)
     }
 
     /// Levels on demand: what says, beside the mapping, which levels of
@@ -1034,6 +1159,7 @@ impl Staging {
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let refill = self.needs_fill.load(std::sync::atomic::Ordering::Relaxed);
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
@@ -1041,7 +1167,7 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            if !refill && unwritten && !turn {
                 return 0;
             }
         }
@@ -1080,11 +1206,11 @@ impl Staging {
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 let hash = digest(read);
-                if last.hash == Some(hash) {
+                if !refill && last.hash == Some(hash) {
                     return false;
                 }
                 last.hash = Some(hash);
-                if read.iter().all(|&b| b == 0) {
+                if !refill && read.iter().all(|&b| b == 0) {
                     return false;
                 }
                 self.detile(read);
@@ -1102,7 +1228,7 @@ impl Staging {
                 let hash = digest(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-                if last.hash == Some(hash) {
+                if !refill && last.hash == Some(hash) {
                     return size;
                 }
                 last.hash = Some(hash);
@@ -1118,7 +1244,7 @@ impl Staging {
         let hash = digest(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if !refill && last.hash == Some(hash) {
             return size;
         }
         last.hash = Some(hash);
@@ -1136,12 +1262,13 @@ impl Staging {
     /// Returns the bytes read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        let refill = self.needs_fill.load(Relaxed);
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
             let hash = digest(read);
-            if last.hash != Some(hash) {
+            if refill || last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
             }
@@ -1159,18 +1286,19 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        use std::sync::atomic::Ordering::Relaxed;
         // Held while the buffer is written: nothing lets it go meanwhile.
         let mut mem = self.mem.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(data) = self.mapped(&mut mem) else {
+        let Some(data) = self.ensure_mem(&mut mem) else {
             return;
         };
-        self.changed.store(crate::host::moment(), std::sync::atomic::Ordering::Relaxed);
-        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.needs_fill.store(false, Relaxed);
+        self.changed.store(crate::host::moment(), Relaxed);
+        self.dirty.store(true, Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
         let held = if self.on_demand {
-            use std::sync::atomic::Ordering::Relaxed;
             let judged = self.judgement();
             self.judged[0].store(judged[0], Relaxed);
             self.judged[1].store(judged[1], Relaxed);
@@ -1188,6 +1316,27 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        let started = std::time::Instant::now();
+        let copy_size = self.read_size.min(tiled.len());
+        if let Some(mode) = BY_MODE.get(self.layout.desc.swizzle.0 as usize) {
+            mode.fetch_add(copy_size as u64, Relaxed);
+        }
+        if let Some(gpu) = &self.gpu {
+            // Card detiling: plain linear copy of tiled bytes + held mask;
+            // prelude compute shader performs the address arithmetic on GPU.
+            let n = copy_size.min(gpu.raw.tiled_bytes);
+            // SAFETY: upload buffer holds `gpu.raw.bytes` under `self.mem` lock.
+            unsafe {
+                std::ptr::copy_nonoverlapping(tiled.as_ptr(), data as *mut u8, n);
+                crate::gpudetile::write_mask(&gpu.raw, data as *mut u8, held);
+            }
+            crate::gpudetile::STATS[2].fetch_add(n as u64, Relaxed);
+            crate::gpudetile::STATS[3].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+            return;
+        }
+        DETILED[1].fetch_add(copy_size as u64, Relaxed);
+        DETILED[2].fetch_add(1, Relaxed);
+        let _timed = DetileTimed(started);
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (host_mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let mip = host_mip + self.dropped;
@@ -1211,6 +1360,17 @@ impl Staging {
                 return;
             }
         }
+    }
+}
+
+struct DetileTimed(std::time::Instant);
+
+impl Drop for DetileTimed {
+    fn drop(&mut self) {
+        DETILED[0].fetch_add(
+            self.0.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
@@ -1261,6 +1421,55 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     let hash = hasher.finalize();
     let mut first = [0u8; 8];
     first.copy_from_slice(&hash.as_bytes()[..8]);
+    u64::from_le_bytes(first) | 1
+}
+
+/// Maximum size for full-texture fingerprinting of aliased textures (faces,
+/// hair painted through another view; `VICTORY_FULL_PRINT_KB` or
+/// `K6_FULL_PRINT_KB`, default `4096` KiB, `0` disables; `kitty-core/Kitty6` `ae3cce8`).
+fn full_print_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        ["VICTORY_FULL_PRINT_KB", "K6_FULL_PRINT_KB"]
+            .iter()
+            .find_map(|k| std::env::var(k).ok().and_then(|v| v.trim().parse::<usize>().ok()))
+            .unwrap_or(4096)
+            << 10
+    })
+}
+
+/// Whether any 64 KiB page of `[at, at + len)` is mapped at another title
+/// address too (used to recheck dynamically painted face/hair textures).
+pub(crate) fn aliased(at: u64, len: u64) -> bool {
+    crate::inplace::has_alias(at as usize, at.saturating_add(len) as usize)
+}
+
+/// Full-body fingerprint for aliased textures up to [`full_print_bytes`] using
+/// fast `xxh3-128` 64 KiB chunks; falls back to [`fingerprint`] otherwise.
+pub(crate) fn fingerprint_texture(at: u64, len: u64) -> u64 {
+    const WINDOW: usize = 64 << 10;
+    let most = full_print_bytes();
+    let n = len as usize;
+    if n <= 48 << 10 || n > most || !aliased(at, len) {
+        return fingerprint(at, len);
+    }
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let mut print = 0x6b36_u128;
+    READ.with(|read| {
+        let mut read = read.borrow_mut();
+        read.resize(WINDOW, 0);
+        let mut from = 0;
+        while from < n {
+            let bytes = WINDOW.min(n - from);
+            read[..bytes].fill(0);
+            crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
+            print = print.rotate_left(37) ^ digest(&read[..bytes]);
+            from += bytes;
+        }
+    });
+    let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
     u64::from_le_bytes(first) | 1
 }
 
@@ -1492,19 +1701,62 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let read_size = layout.bytes_from(dropped) as usize;
+    let (gpu_plan, linear) = if crate::gpudetile::on() && crate::gpudetile::detiler().is_some() {
+        let raw = crate::gpudetile::raw_layout(&layout, read_size);
+        let jobs = crate::gpudetile::jobs(
+            &layout,
+            &footprints,
+            &rows,
+            u32::from(d.MipLevels),
+            dropped,
+            &raw,
+        );
+        let linear = jobs.as_ref().and_then(|_| linear_buffer(host, total));
+        match (jobs, linear) {
+            (Some(jobs), Some(linear)) => {
+                crate::gpudetile::STATS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (
+                    Some(GpuPlan {
+                        raw,
+                        jobs,
+                        total,
+                        recorded: std::sync::atomic::AtomicU64::new(0),
+                    }),
+                    Some(linear),
+                )
+            }
+            _ => {
+                crate::gpudetile::STATS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+    let upload_bytes = gpu_plan.as_ref().map_or(total, |g| g.raw.bytes);
+    let (buffer, data) = host.upload_buffer(upload_bytes)?;
+    if let Some(gpu) = &gpu_plan {
+        // SAFETY: freshly created upload buffer of `gpu.raw.bytes`.
+        unsafe { crate::gpudetile::write_tables(&layout, &gpu.raw, data) };
+    }
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
         )
     });
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    tracing::debug!(?desc, total, upload_bytes, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
-    let read_size = layout.bytes_from(dropped) as usize;
+    STAGED[1].fetch_add(upload_bytes, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
-        mem: Mutex::new(Some((buffer, data as usize))),
+        mem: Mutex::new(Some(StagingMem {
+            buffer,
+            data: data as usize,
+            linear,
+        })),
+        needs_fill: std::sync::atomic::AtomicBool::new(true),
+        gpu: gpu_plan,
         #[cfg(feature = "diagnostics")]
         size: total,
         changed: std::sync::atomic::AtomicU64::new(crate::host::moment()),
@@ -1514,7 +1766,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         mips: u32::from(d.MipLevels),
         dropped,
         read_size,
-        bytes: total,
+        bytes: upload_bytes,
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),

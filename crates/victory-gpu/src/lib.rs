@@ -34,6 +34,8 @@ pub mod ffx;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
+mod gpudetile;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;

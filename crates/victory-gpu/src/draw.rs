@@ -354,9 +354,10 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds: title heap, host heap identity
+    /// (`HostHeap::id`), first, count; given back when the list has run, is
+    /// reset or released.
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -370,8 +371,8 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for &(heap, id, first, n) in &self.dynamic {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
     }
 }
@@ -392,8 +393,8 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for (heap, id, first, n) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
         self.fresh_tables.clear();
         self.root_srv_slots.clear();
@@ -509,6 +510,46 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+
+/// Frames between looks at an uploaded texture picked by index once
+/// [`RECHECK_FRAMES`] finishes (`VICTORY_HEAP_RECHECK_EVERY`; 0 = stop).
+fn recheck_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_RECHECK_EVERY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Frames between looks after [`RECHECK_FRAMES`] for aliased textures (faces,
+/// hair painted through another view of their pages; `VICTORY_ALIASED_RECHECK_EVERY`
+/// or `K6_ALIASED_RECHECK_EVERY`, default `30`, `0` disables; `kitty-core/Kitty6` `ae3cce8`).
+fn aliased_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        ["VICTORY_ALIASED_RECHECK_EVERY", "K6_ALIASED_RECHECK_EVERY"]
+            .iter()
+            .find_map(|k| std::env::var(k).ok().and_then(|v| v.trim().parse().ok()))
+            .unwrap_or(30)
+    })
+}
+
+/// Slow 1x1x1 single-group compute shader (`~10.9 ms` GPU per frame) thinned
+/// to run once every `VICTORY_THIN_SLOW_COMPUTE` frames (default `4`; `0` or
+/// `1` runs every frame; `kitty-core/Kitty6` `7124a8f`).
+const SLOW_SINGLE_GROUP_COMPUTE: &str = "02384a60fda6f2d0";
+
+fn thin_slow_compute_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_THIN_SLOW_COMPUTE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(4)
+    })
+}
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -1496,7 +1537,7 @@ impl State {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.id(), index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -1567,7 +1608,7 @@ impl State {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.id(), index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -2324,13 +2365,29 @@ impl State {
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                if crate::texture::fingerprint_texture(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
-                        None => host.texture_slot_done(index, write, None),
+                        None => match recheck_every() {
+                            0 if aliased_every() > 0 && crate::texture::aliased(at, len) => {
+                                host.texture_slot_recheck(
+                                    index,
+                                    write,
+                                    frame + aliased_every(),
+                                    (at, len),
+                                    print,
+                                    looks,
+                                    uploaded,
+                                )
+                            }
+                            0 => host.texture_slot_done(index, write, None),
+                            every => {
+                                host.texture_slot_recheck(index, write, frame + every, (at, len), print, looks, uploaded)
+                            }
+                        },
                     }
                     continue;
                 }
@@ -2505,7 +2562,7 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
-                    let print = crate::texture::fingerprint(at, len);
+                    let print = crate::texture::fingerprint_texture(at, len);
                     host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
@@ -2585,6 +2642,17 @@ impl State {
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            return;
+        }
+        // Thin the 1x1x1 single-group compute shader (`02384a60fda6f2d0`, ~10.9 ms GPU)
+        // to run every Nth frame (`VICTORY_THIN_SLOW_COMPUTE`, default 4; `kitty-core/Kitty6` `7124a8f`).
+        let thin_every = thin_slow_compute_every();
+        if thin_every > 1
+            && p.stages
+                .iter()
+                .any(|s| s.shader.hash.as_str() == SLOW_SINGLE_GROUP_COMPUTE)
+            && !crate::frame::current().is_multiple_of(thin_every)
+        {
             return;
         }
         if !self.bind(list, p, true) {
@@ -3166,7 +3234,7 @@ impl State {
             };
             self.fresh_tables.insert(key, first);
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
