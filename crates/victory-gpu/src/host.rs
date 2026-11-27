@@ -18,6 +18,8 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+mod segments;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -758,6 +760,9 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        if let Some(adapter) = &adapter {
+            segments::log(adapter);
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -3111,12 +3116,13 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
-/// Resets the host lists of settled flights and keeps them for reuse, as
-/// a queue does for the lists it ran (`crate::list::recycle`).
+/// Resets the host lists of settled flights and keeps them for reuse
+/// immediately while retiring their held objects through the bury lag
+/// (`crate::list::recycle_landed`; `klbf-lab` `867330f`).
 fn land() {
     let landed = std::mem::take(&mut line().landed);
     for (lists, order) in landed {
-        crate::list::recycle(lists, &order);
+        crate::list::recycle_landed(lists, &order);
     }
 }
 
@@ -5101,8 +5107,18 @@ impl Host {
         };
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         RELAY_MOVED.notify_one();
+        // RDNA2 aperture-segment back-off (`klbf-lab` `680c779`): while an
+        // aperture segment exceeds `VICTORY_SEGMENT_TIGHT` (80% on / 70% off),
+        // land flights synchronously and trim idle host lists to 64 so command
+        // allocators cannot exhaust the 2 GB aperture and remove the device.
+        let tight = self.adapter.as_ref().is_some_and(segments::tight);
+        if tight {
+            crate::list::trim_idle_tight();
+        }
         if told && !late_writes() {
             self.settle(&mut submitted, WHY_WRITES);
+        } else if tight {
+            self.settle(&mut submitted, WHY_MOST);
         } else if most && relay_exact() {
             // Until there are fewer, not until there are none.
             relay_wait(WHY_MOST, |line| line.lists < late_most());
@@ -5896,6 +5912,19 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+    }
+
+    /// Detaches host objects held by this list (deferred work, texture/buffer
+    /// references, twin handles) so `list::recycle_landed` can retire them for
+    /// the bury lag while immediately resetting and pooling the command list
+    /// and allocator (`klbf-lab` `867330f`).
+    pub(crate) fn take_held(&self) -> Box<dyn std::any::Any> {
+        let deferred = std::mem::take(&mut *self.deferred());
+        let states = std::mem::take(&mut *self.states.lock().unwrap_or_else(|e| e.into_inner()));
+        self.states_generation.fetch_add(1, Ordering::Release);
+        let buffers = std::mem::take(&mut *self.buffers.lock().unwrap_or_else(|e| e.into_inner()));
+        let twins = std::mem::take(&mut *self.twins.lock().unwrap_or_else(|e| e.into_inner()));
+        Box::new((deferred, states, buffers, twins))
     }
 
     /// Only after the list's last submission finished (every one is waited
@@ -7527,6 +7556,250 @@ fn record_layers(
     }
 }
 
+/// Whether the crisp white top-left on-screen `FPS: X.X` counter is drawn
+/// (`VICTORY_FPS_HUD`, on by default; `0` disables).
+fn fps_hud_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FPS_HUD").is_none_or(|v| v != "0"))
+}
+
+/// Packs `"FPS: X.X"` (from `tenths` = FPS * 10, clamped to 999.9) into 10
+/// 4-bit glyph indices across `[word0, word1]`:
+/// `0..=9` digits, `10`='F', `11`='P', `12`='S', `13`=':', `14`='.', `15`=' '.
+fn pack_fps_text(tenths: u32) -> [u32; 2] {
+    let clamped = tenths.min(9999);
+    let whole = clamped / 10;
+    let frac = clamped % 10;
+    let mut chars = [15u32; 10];
+    chars[0] = 10; // F
+    chars[1] = 11; // P
+    chars[2] = 12; // S
+    chars[3] = 13; // :
+    chars[4] = 15; // space
+    let mut pos = 5;
+    if whole >= 100 {
+        chars[pos] = (whole / 100) % 10;
+        pos += 1;
+    }
+    if whole >= 10 {
+        chars[pos] = (whole / 10) % 10;
+        pos += 1;
+    }
+    chars[pos] = whole % 10;
+    chars[pos + 1] = 14; // .
+    chars[pos + 2] = frac;
+    let mut w0 = 0u32;
+    let mut w1 = 0u32;
+    for (i, &g) in chars.iter().enumerate() {
+        if i < 8 {
+            w0 |= (g & 0xf) << (i * 4);
+        } else {
+            w1 |= (g & 0xf) << ((i - 8) * 4);
+        }
+    }
+    [w0, w1]
+}
+
+/// Self-contained 5x7 crisp white bitmap-font HUD shader (`FPS: 4.7` in the
+/// top-left corner with a 1-cell dark drop shadow, zero buffers/descriptors).
+const FPS_HUD_HLSL: &str = r#"
+#define RS "RootConstants(num32BitConstants = 4, b0)"
+cbuffer Hud : register(b0) {
+    uint word0;
+    uint word1;
+    uint scale;
+    uint origin;
+};
+struct VOut { float4 p : SV_Position; };
+[RootSignature(RS)]
+VOut vs_main(uint i : SV_VertexID) {
+    float2 t = float2(i & 1, i >> 1) * 2.0;
+    VOut o;
+    o.p = float4(t.x * 2.0 - 1.0, 1.0 - t.y * 2.0, 0.0, 1.0);
+    return o;
+}
+static const uint GLYPH_LO[16] = {
+    0x239ACE2Eu, // 0
+    0x08421184u, // 1
+    0x2083062Eu, // 2
+    0x2213062Eu, // 3
+    0x05F928C2u, // 4
+    0x2210FA1Fu, // 5
+    0x231F4106u, // 6
+    0x1082083Fu, // 7
+    0x2317462Eu, // 8
+    0x0417C62Eu, // 9
+    0x210F421Fu, // F
+    0x210F463Eu, // P
+    0x0217420Fu, // S
+    0x08401080u, // :
+    0x18000000u, // .
+    0x00000000u  // space
+};
+static const uint GLYPH_HI[16] = {
+    0x0Eu, // 0
+    0x0Eu, // 1
+    0x1Fu, // 2
+    0x0Eu, // 3
+    0x02u, // 4
+    0x0Eu, // 5
+    0x0Eu, // 6
+    0x08u, // 7
+    0x0Eu, // 8
+    0x0Cu, // 9
+    0x10u, // F
+    0x10u, // P
+    0x1Eu, // S
+    0x00u, // :
+    0x0Cu, // .
+    0x00u  // space
+};
+bool glyph_px(int gx, int gy) {
+    if (gx < 0 || gy < 0 || gy >= 7) return false;
+    uint ch = (uint)gx / 6u;
+    uint col = (uint)gx % 6u;
+    if (ch >= 10u || col >= 5u) return false;
+    uint g = (ch < 8u) ? ((word0 >> (ch * 4u)) & 0xFu) : ((word1 >> ((ch - 8u) * 4u)) & 0xFu);
+    uint bit = 4u - col;
+    if (gy < 6) {
+        return ((GLYPH_LO[g] >> ((uint)gy * 5u + bit)) & 1u) != 0u;
+    }
+    return ((GLYPH_HI[g] >> bit) & 1u) != 0u;
+}
+[RootSignature(RS)]
+float4 ps_main(VOut v) : SV_Target {
+    int ox = (int)(origin & 0xFFFFu);
+    int oy = (int)(origin >> 16u);
+    int2 p = int2(v.p.xy) - int2(ox, oy);
+    if (p.x < 0 || p.y < 0) discard;
+    int s = max((int)scale, 1);
+    int gx = p.x / s;
+    int gy = p.y / s;
+    if (glyph_px(gx, gy)) {
+        return float4(1.0, 1.0, 1.0, 1.0);
+    }
+    if (glyph_px(gx - 1, gy - 1)) {
+        return float4(0.0, 0.0, 0.0, 0.85);
+    }
+    discard;
+    return float4(0.0, 0.0, 0.0, 0.0);
+}
+"#;
+
+fn make_fps_hud(_blended: bool, format: DXGI_FORMAT) -> windows::core::Result<PlanePipeline> {
+    use windows::core::s;
+    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+    let vs = compile(FPS_HUD_HLSL, s!("vs_main"), s!("vs_5_1"))?;
+    let ps = compile(FPS_HUD_HLSL, s!("ps_main"), s!("ps_5_1"))?;
+    let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+        pShaderBytecode: bytes.as_ptr().cast(),
+        BytecodeLength: bytes.len(),
+    };
+    let mut blend = D3D12_BLEND_DESC::default();
+    blend.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+        BlendEnable: true.into(),
+        LogicOpEnable: false.into(),
+        SrcBlend: D3D12_BLEND_SRC_ALPHA,
+        DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
+        BlendOp: D3D12_BLEND_OP_ADD,
+        SrcBlendAlpha: D3D12_BLEND_ONE,
+        DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA,
+        BlendOpAlpha: D3D12_BLEND_OP_ADD,
+        LogicOp: D3D12_LOGIC_OP_NOOP,
+        RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+    };
+    let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
+    formats[0] = format;
+    // SAFETY: root signature embedded in `ps`; descriptors outlive the call.
+    unsafe {
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            VS: code(&vs[..]),
+            PS: code(&ps[..]),
+            BlendState: blend,
+            SampleMask: u32::MAX,
+            RasterizerState: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                DepthClipEnable: true.into(),
+                ..Default::default()
+            },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 1,
+            RTVFormats: formats,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let pipeline: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc)?;
+        Ok((root, pipeline))
+    }
+}
+
+fn fps_hud_pass() -> Option<&'static PlanePass> {
+    static PASS: OnceLock<Option<PlanePass>> = OnceLock::new();
+    PASS.get_or_init(PlanePass::new).as_ref()
+}
+
+/// Draws a crisp white top-left `FPS: X.X` overlay into `target_tex` (in
+/// `D3D12_RESOURCE_STATE_PRESENT` before and after).
+fn record_fps_hud(
+    host: &Host,
+    list: &ID3D12GraphicsCommandList,
+    target_tex: &ID3D12Resource,
+    (width, height, format): (u32, u32, DXGI_FORMAT),
+    fps_tenths: u32,
+) {
+    if !fps_hud_on() {
+        return;
+    }
+    let Some(pass) = fps_hud_pass() else { return };
+    let Some((root, pipeline)) = pass.made_with(false, format, make_fps_hud) else {
+        return;
+    };
+    let scale = (height / 360).clamp(2, 5);
+    let (ox, oy) = (12u32, 10u32);
+    let [w0, w1] = pack_fps_text(fps_tenths);
+    let constants = [w0, w1, scale, (ox & 0xffff) | ((oy & 0xffff) << 16)];
+    let box_w = (10 * 6 + 2) * scale;
+    let box_h = (7 + 2) * scale;
+    let rtv = host.rtv(Some(target_tex), None);
+    // SAFETY: open command list, live render target in PRESENT state,
+    // process-lifetime root signature and PSO.
+    unsafe {
+        list.ResourceBarrier(&[transition(
+            target_tex,
+            D3D12_RESOURCE_STATE_PRESENT,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        )]);
+        list.OMSetRenderTargets(1, Some(&rtv), false, None);
+        list.SetGraphicsRootSignature(&root);
+        list.SetPipelineState(&pipeline);
+        list.SetGraphicsRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+        list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(4));
+        list.RSSetViewports(&[D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: width as f32,
+            Height: height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }]);
+        list.RSSetScissorRects(&[RECT {
+            left: ox as i32,
+            top: oy as i32,
+            right: (ox + box_w).min(width) as i32,
+            bottom: (oy + box_h).min(height) as i32,
+        }]);
+        list.DrawInstanced(3, 1, 0, 0);
+        list.ResourceBarrier(&[transition(
+            target_tex,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PRESENT,
+        )]);
+    }
+}
+
 #[cfg(test)]
 mod layer_tests {
     use super::{fractions, texels};
@@ -7577,11 +7850,14 @@ struct Presenter {
     ui: Option<ID3D12Resource>,
 }
 
-/// The frame rate, shown in the window's caption every second and logged
-/// every few seconds.
+/// The frame rate, shown in the window's caption every second, on-screen via
+/// `FPS: X.X` every 0.5 s, and logged every few seconds.
 struct Meter {
     since: std::time::Instant,
     frames: u32,
+    hud_since: std::time::Instant,
+    hud_frames: u32,
+    hud_fps_tenths: u32,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
@@ -7596,12 +7872,19 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
+            hud_since: now,
+            hud_frames: 0,
+            hud_fps_tenths: 0,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
         }
+    }
+
+    fn fps_tenths(&self) -> u32 {
+        self.hud_fps_tenths
     }
 
     /// Counts a presented frame.
@@ -7611,6 +7894,14 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        self.hud_frames += 1;
+        let hud_elapsed = self.hud_since.elapsed();
+        if hud_elapsed >= std::time::Duration::from_millis(500) {
+            let fps = f64::from(self.hud_frames) / hud_elapsed.as_secs_f64();
+            self.hud_fps_tenths = (fps * 10.0).round().clamp(0.0, 9999.0) as u32;
+            self.hud_since = std::time::Instant::now();
+            self.hud_frames = 0;
+        }
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -8027,6 +8318,7 @@ impl Host {
                         D3D12_RESOURCE_STATE_PRESENT,
                     ),
                 ]);
+                record_fps_hud(self, list, &back, (width, height, format), p.meter.fps_tenths());
             } else {
                 // With frame generation a full-window interface plane is
                 // drawn alone, for the SDK to compose over real and
@@ -8038,8 +8330,12 @@ impl Host {
                     Some(ui) => {
                         record_layers(self, list, &back, &layers[..1], (width, height, format));
                         record_layers(self, list, ui, &layers[1..], (width, height, format));
+                        record_fps_hud(self, list, ui, (width, height, format), p.meter.fps_tenths());
                     }
-                    None => record_layers(self, list, &back, layers, (width, height, format)),
+                    None => {
+                        record_layers(self, list, &back, layers, (width, height, format));
+                        record_fps_hud(self, list, &back, (width, height, format), p.meter.fps_tenths());
+                    }
                 }
                 #[cfg(feature = "diagnostics")]
                 if save_frame {
@@ -9143,6 +9439,31 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         }
         for potato in ["2", "ultra", "POTATO", "max", "5", "99"] {
             assert_eq!(parse_low_graphics(potato), 2, "input {potato:?}");
+        }
+    }
+
+    #[test]
+    fn fps_hud_packs_text_and_builds_pipeline() {
+        use super::{DXGI_FORMAT_R8G8B8A8_UNORM, host, make_fps_hud, pack_fps_text};
+        let unpack = |[w0, w1]: [u32; 2]| -> String {
+            const LUT: [char; 16] = [
+                '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'F', 'P', 'S', ':', '.', ' ',
+            ];
+            (0..10)
+                .map(|i| {
+                    let g = if i < 8 { (w0 >> (i * 4)) & 0xf } else { (w1 >> ((i - 8) * 4)) & 0xf };
+                    LUT[g as usize]
+                })
+                .collect()
+        };
+        assert_eq!(unpack(pack_fps_text(47)), "FPS: 4.7  ");
+        assert_eq!(unpack(pack_fps_text(243)), "FPS: 24.3 ");
+        assert_eq!(unpack(pack_fps_text(1205)), "FPS: 120.5");
+        assert_eq!(unpack(pack_fps_text(0)), "FPS: 0.0  ");
+        if let Some(h) = host() {
+            let _ = make_fps_hud(false, DXGI_FORMAT_R8G8B8A8_UNORM)
+                .expect("FPS HUD HLSL & PSO must compile cleanly");
+            assert_eq!(h.log_messages(), None, "D3D12 debug layer reported error");
         }
     }
 }

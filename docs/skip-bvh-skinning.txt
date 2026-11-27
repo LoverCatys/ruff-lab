@@ -1,0 +1,8 @@
+# Shader hashes skipped when VICTORY_SKIP_BVH_SKINNING=1
+#
+# One 16-hex-digit BLAKE3-prefix hash per line. Blank lines and
+# lines starting with '#' are ignored.
+#
+# Place this file beside victory.exe or pass
+# VICTORY_SKIP_BVH_SKINNING=@<path> to skip BVH-skinning compute dispatches
+# when hardware ray tracing is off.

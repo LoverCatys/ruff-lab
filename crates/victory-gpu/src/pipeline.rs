@@ -615,6 +615,86 @@ fn skipped_shader(shaders: &[Arc<Shader>]) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
+/// Parses a file of shader hashes (one 16-hex-digit hash per line; blank
+/// lines and `#`-prefixed comments are ignored).
+#[cfg(any(windows, test))]
+fn parse_skip_hashes_lines(text: &str) -> Vec<String> {
+    let comma_joined: String = text
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    #[cfg(windows)]
+    {
+        parse_skip_hashes(&comma_joined)
+    }
+    #[cfg(not(windows))]
+    {
+        comma_joined
+            .split(',')
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .filter_map(|h| {
+                (h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .then(|| h.to_ascii_lowercase())
+            })
+            .collect()
+    }
+}
+
+/// Shader hashes skipped when `VICTORY_SKIP_BVH_SKINNING=1` (loads
+/// `skip-bvh-skinning.txt` next to the exe, or `@<path>` for a custom file;
+/// `Marvisak/VIctory#3536`).
+#[cfg(windows)]
+fn skip_bvh_skinning_hashes() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        let Ok(val) = std::env::var("VICTORY_SKIP_BVH_SKINNING") else {
+            return Vec::new();
+        };
+        let val = val.trim();
+        if val.is_empty() || val == "0" {
+            return Vec::new();
+        }
+        let path = if let Some(custom) = val.strip_prefix('@') {
+            std::path::PathBuf::from(custom)
+        } else {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("skip-bvh-skinning.txt")))
+                .unwrap_or_else(|| std::path::PathBuf::from("skip-bvh-skinning.txt"))
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let list = parse_skip_hashes_lines(&text);
+                tracing::info!(path = %path.display(), count = list.len(), "VICTORY_SKIP_BVH_SKINNING loaded");
+                list
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "VICTORY_SKIP_BVH_SKINNING: hash file not readable");
+                Vec::new()
+            }
+        }
+    })
+}
+
+/// Whether pipeline `this` is skipped by `VICTORY_SKIP_BVH_SKINNING=1`.
+#[cfg(windows)]
+pub(crate) fn is_bvh_skinning_skipped(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let hashes = skip_bvh_skinning_hashes();
+    if hashes.is_empty() {
+        return false;
+    }
+    pipeline(this)
+        .shaders
+        .iter()
+        .any(|s| hashes.contains(&s.hash))
+}
+
 #[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     if this.is_null() {
@@ -858,20 +938,32 @@ fn read_stream(
             );
             break;
         };
-        if at + size > stream.len() {
+        let Some(next) = at.checked_add(size) else {
+            tracing::warn!(kind, at, size, "pipeline subobject overflows stream");
+            break;
+        };
+        if next > stream.len() {
+            tracing::warn!(
+                kind,
+                at,
+                size,
+                len = stream.len(),
+                "truncated pipeline subobject; the rest is ignored"
+            );
             break;
         }
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*stream.as_ptr().add(at + 8).cast::<Bytecode>() };
-            shaders.extend(shader(stage, code));
+            // SAFETY: bounds checked above (`at + 24 <= stream.len()`);
+            // unaligned read avoids UB on unaligned stream slices (`Vice-Tay#350`).
+            let code = unsafe { stream.as_ptr().add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(shader(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
         unsafe {
             graphics.read(kind, stream.as_ptr().add(at))
         };
-        at += size;
+        at = next;
     }
     (shaders, graphics)
 }
@@ -1030,6 +1122,17 @@ mod tests {
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
+    }
+
+    #[test]
+    fn skip_hashes_lines_parses_comments_and_blanks() {
+        let text = "# comment\n\n  0123456789ABCDEF # inline\nshort\n0011223344556677\n";
+        assert_eq!(
+            super::parse_skip_hashes_lines(text),
+            ["0123456789abcdef", "0011223344556677"]
+        );
+        #[cfg(windows)]
+        assert!(!super::is_bvh_skinning_skipped(std::ptr::null()));
     }
 
     #[cfg(windows)]

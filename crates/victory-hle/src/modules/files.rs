@@ -13,10 +13,11 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
 
+use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
 use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
@@ -135,9 +136,108 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
     out
 }
 
+/// Optional read-only SSD overlay folder (`VICTORY_SSD_OVERLAY_DIR`, e.g.
+/// `F:\GTA6-SSD`): scanned once at startup so any hot `.rpf` copied onto an
+/// SSD is transparently opened from the SSD instead of the rotational HDD
+/// without moving the rest of the game directory.
+fn ssd_overlay() -> &'static HashMap<String, Vec<u16>> {
+    static OVERLAY: OnceLock<HashMap<String, Vec<u16>>> = OnceLock::new();
+    OVERLAY.get_or_init(|| {
+        let Some(dir) = std::env::var_os("VICTORY_SSD_OVERLAY_DIR").filter(|v| !v.is_empty())
+        else {
+            return HashMap::new();
+        };
+        let map = scan_overlay(Path::new(&dir));
+        if !map.is_empty() {
+            tracing::info!(
+                dir = %Path::new(&dir).display(),
+                files = map.len(),
+                "ssd overlay: redirecting matching read-only title files to SSD"
+            );
+        }
+        map
+    })
+}
+
+fn scan_overlay(root: &Path) -> HashMap<String, Vec<u16>> {
+    fn walk(base: &Path, dir: &Path, depth: usize, out: &mut HashMap<String, Vec<u16>>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < 2 {
+                    walk(base, &path, depth + 1, out);
+                }
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(base) else {
+                continue;
+            };
+            let key = rel
+                .to_string_lossy()
+                .replace('/', "\\")
+                .trim_start_matches('\\')
+                .to_ascii_lowercase();
+            let full = std::path::absolute(&path).unwrap_or(path);
+            let mut wide: Vec<u16> = full.as_os_str().encode_wide().collect();
+            wide.push(0);
+            out.insert(key, wide);
+        }
+    }
+    let mut map = HashMap::new();
+    if root.is_dir() {
+        walk(root, root, 0, &mut map);
+    }
+    map
+}
+
+fn overlay_lookup(map: &HashMap<String, Vec<u16>>, tail: &[u16]) -> Option<Vec<u16>> {
+    if map.is_empty() {
+        return None;
+    }
+    let mut rel = String::from_utf16_lossy(tail).replace('/', "\\");
+    while rel.starts_with('\\') {
+        rel.remove(0);
+    }
+    if rel.is_empty() {
+        return None;
+    }
+    map.get(&rel.to_ascii_lowercase()).cloned()
+}
+
+/// Whether `path` (NUL-terminated UTF-16) resolves to a file in the SSD overlay.
+pub(crate) fn is_ssd_overlay_path(path: *const u16) -> bool {
+    if path.is_null() {
+        return false;
+    }
+    let map = ssd_overlay();
+    if map.is_empty() {
+        return false;
+    }
+    // SAFETY: NUL-terminated UTF-16 string from the title.
+    let slice = unsafe {
+        let len = (0..).take_while(|&i| *path.add(i) != 0).count();
+        std::slice::from_raw_parts(path, len)
+    };
+    let rest = slice.strip_prefix(&VERBATIM[..]).unwrap_or(slice);
+    let &[letter, colon, ..] = rest else {
+        return false;
+    };
+    if colon != u16::from(b':') || u8::try_from(letter).ok().filter(u8::is_ascii_alphabetic).is_none() {
+        return false;
+    }
+    overlay_lookup(map, &rest[2..]).is_some()
+}
+
 /// The host path, NUL-terminated, for `path` (without its NUL) if it is on
 /// a virtual drive.
 pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
+    translate_inner(path, false)
+}
+
+fn translate_inner(path: &[u16], allow_overlay: bool) -> Option<Vec<u16>> {
     let (prefix, rest) = match path.strip_prefix(&VERBATIM[..]) {
         Some(rest) => (&VERBATIM[..], rest),
         None => (&[][..], path),
@@ -153,6 +253,11 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let drives = drives();
     let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
     let tail = &rest[2..];
+    if allow_overlay
+        && let Some(hit) = overlay_lookup(ssd_overlay(), tail)
+    {
+        return Some(hit);
+    }
     if prefix.is_empty() && root.len() + tail.len() >= LONG {
         let mut out = verbatim(root, tail);
         out.push(0);
@@ -187,6 +292,10 @@ impl Wide {
 }
 
 fn wide(path: *const u16) -> Wide {
+    wide_with_overlay(path, false)
+}
+
+fn wide_with_overlay(path: *const u16, allow_overlay: bool) -> Wide {
     if path.is_null() {
         return Wide(path, None);
     }
@@ -195,7 +304,7 @@ fn wide(path: *const u16) -> Wide {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         std::slice::from_raw_parts(path, len)
     };
-    let host = translate(path_slice);
+    let host = translate_inner(path_slice, allow_overlay);
     trace(path_slice, host.as_deref());
     Wide(path, host)
 }
@@ -212,6 +321,10 @@ fn trace(path: &[u16], host: Option<&[u16]>) {
 /// A narrow path (ANSI code page, as the host decodes it) on a virtual
 /// drive, as a wide host path.
 fn narrow(path: *const c_char) -> Option<Vec<u16>> {
+    narrow_with_overlay(path, false)
+}
+
+fn narrow_with_overlay(path: *const c_char, allow_overlay: bool) -> Option<Vec<u16>> {
     if path.is_null() {
         return None;
     }
@@ -233,7 +346,7 @@ fn narrow(path: *const c_char) -> Option<Vec<u16>> {
         MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n);
         wide
     };
-    let host = translate(&wide);
+    let host = translate_inner(&wide, allow_overlay);
     trace(&wide, host.as_deref());
     host
 }
@@ -270,6 +383,14 @@ fn dropped_flags(access: u32, flags: u32) -> u32 {
     }
 }
 
+fn read_only_open(access: u32, disposition: u32) -> bool {
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_WRITE_DATA: u32 = 0x0002;
+    const FILE_APPEND_DATA: u32 = 0x0004;
+    const OPEN_EXISTING: u32 = 3;
+    disposition == OPEN_EXISTING && (access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA)) == 0
+}
+
 pub extern "system" fn CreateFileW(
     path: *const u16,
     access: u32,
@@ -279,7 +400,7 @@ pub extern "system" fn CreateFileW(
     flags: u32,
     template: Handle,
 ) -> Handle {
-    let p = wide(path);
+    let p = wide_with_overlay(path, read_only_open(access, disposition));
     let flags = flags & !dropped_flags(access, flags);
     host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
@@ -302,7 +423,7 @@ pub extern "system" fn CreateFileA(
     template: Handle,
 ) -> Handle {
     let flags = flags & !dropped_flags(access, flags);
-    match narrow(path) {
+    match narrow_with_overlay(path, read_only_open(access, disposition)) {
         Some(p) => {
             host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
                 p.as_ptr(),
@@ -336,7 +457,7 @@ pub extern "system" fn CreateFile2(
     disposition: u32,
     params: *const c_void,
 ) -> Handle {
-    let p = wide(path);
+    let p = wide_with_overlay(path, read_only_open(access, disposition));
     host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
         p.ptr(),
         access,
@@ -1019,5 +1140,27 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    #[test]
+    fn ssd_overlay_redirects_matching_files_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        let levels = dir.path().join("levels.rpf");
+        std::fs::write(&levels, b"ssd").unwrap();
+        let sub = dir.path().join("data");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("hot.bin"), b"ssd").unwrap();
+
+        let map = scan_overlay(dir.path());
+        let tail_hit: Vec<u16> = "\\LEVELS.RPF".encode_utf16().collect();
+        let resolved = overlay_lookup(&map, &tail_hit).expect("must hit overlay");
+        let resolved_str = String::from_utf16_lossy(&resolved[..resolved.len() - 1]);
+        assert!(resolved_str.to_ascii_lowercase().ends_with("levels.rpf"));
+
+        let sub_hit: Vec<u16> = "/Data/Hot.bin".encode_utf16().collect();
+        assert!(overlay_lookup(&map, &sub_hit).is_some());
+
+        let miss: Vec<u16> = "\\audio.rpf".encode_utf16().collect();
+        assert!(overlay_lookup(&map, &miss).is_none());
     }
 }

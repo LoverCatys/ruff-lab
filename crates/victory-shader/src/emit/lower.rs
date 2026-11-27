@@ -925,18 +925,18 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     Some(meet)
 }
 
-/// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
-/// own bit by its console lane.
+/// Masks held as opaque numbers in guards or lane branches: the lane tests its
+/// own bit by its console lane. Constant lane sets in compute/mesh shaders use
+/// `flattenedThreadIdInGroup & (wave - 1)` without forcing `WaveSize(64)`
+/// (`Marvisak/VIctory#3496`).
 fn lane_constant_masks(st: &Structured) -> bool {
     let whens = st.exits.iter().filter_map(|e| match *e {
         LaneExit::Branch { when, .. } => Some(when),
         _ => None,
     });
     let mut work: Vec<Bool> = st.guards.iter().flatten().flatten().copied().chain(whens).collect();
-    // Through lane-mask joins too: an edge that brings a number or a constant lane set needs
+    // Through lane-mask joins too: an edge that brings an opaque number needs
     // the lane's own bit of it.
-    // shortcut: masks only selects read (`v_cndmask_b32`, carries in) are not followed; such
-    // a program still stops with "a constant lane mask" or "an opaque lane mask".
     let (mut seen, mut joins) = (HashSet::new(), HashSet::new());
     while let Some(g) = work.pop() {
         if !seen.insert(g) {
@@ -944,7 +944,7 @@ fn lane_constant_masks(st: &Structured) -> bool {
         }
         for a in st.bools.support(g) {
             match a {
-                Atom::Opaque(_) | Atom::Constant(_) => return true,
+                Atom::Opaque(_) => return true,
                 Atom::Phi(id) if joins.insert(id) => {
                     if let Some(edges) = st.phi_masks.get(&id) {
                         work.extend(edges.iter().copied());
@@ -3911,6 +3911,12 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
+            Atom::Constant(k) if self.s.threads.is_some() => {
+                let lo = self.s.m.i32(k as u32);
+                let hi = self.s.m.i32((k >> 32) as u32);
+                let lane = self.flat_console_lane(at);
+                Ok(self.lane_bit_of(at, lane, lo, Some(hi)))
+            }
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
         }
@@ -4143,6 +4149,11 @@ impl<'a> Lower<'a> {
         } else {
             self.s.op(at, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[])
         };
+        self.lane_bit_of(at, lane, lo, hi)
+    }
+
+    /// Bit `lane` of the mask `lo`, `hi` (wave64) without requiring wave ops.
+    fn lane_bit_of(&mut self, at: usize, lane: V, lo: V, hi: Option<V>) -> V {
         let (k31, k32, one, z) = (
             self.s.m.i32(31),
             self.s.m.i32(32),
@@ -4160,6 +4171,14 @@ impl<'a> Lower<'a> {
         let t = self.s.m.bin(at, Bin::LShr, word, sh);
         let t = self.s.m.bin(at, Bin::And, t, one);
         self.s.m.cmp(at, pred::NE, t, z)
+    }
+
+    /// Console lane index (`0..wave`) from the thread's flat group index, for
+    /// compute and mesh shaders that do not relabel threads (`!console_lanes`).
+    fn flat_console_lane(&mut self, at: usize) -> V {
+        let f = self.mesh_thread();
+        let mask = self.s.m.i32(self.wave() - 1);
+        self.s.m.bin(at, Bin::And, f, mask)
     }
 
     /// `half_waves`: of a host ballot's dwords `lo`, `hi`, the one of this lane's half.
@@ -5672,8 +5691,9 @@ impl<'a> Lower<'a> {
                     "s_min_i32" => pred::SLT,
                     _ => pred::SGT,
                 };
-                let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                // RDNA2 SCC follows whether `src0` won the comparison (`Vice-Tay#315`).
+                let first_wins = self.s.m.cmp(c, p, a, b);
+                (self.s.m.select(c, first_wins, a, b), Some(first_wins))
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
@@ -5698,14 +5718,24 @@ impl<'a> Lower<'a> {
                 }
             }
             "s_bfm_b32" => {
-                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let k31 = self.s.m.i32(31);
-                let one = self.s.m.i32(1);
-                let a = self.s.m.bin(c, Bin::And, a, k31);
-                let b = self.s.m.bin(c, Bin::And, b, k31);
-                let m = self.s.m.bin(c, Bin::Shl, one, a);
-                let m = self.s.m.bin(c, Bin::Sub, m, one);
-                (self.s.m.bin(c, Bin::Shl, m, b), None)
+                let (width, offset) = (src32(self, 0)?, src32(self, 1)?);
+                let immediate = self.s.m.int_value(width).zip(self.s.m.int_value(offset));
+                let mask = if let Some((width, offset)) = immediate {
+                    self.s.m.i32(((1u32 << (width & 31)) - 1) << (offset & 31))
+                } else {
+                    // DXIL Bfi masks width/offset to 5 bits (`Marvisak/VIctory#3528`).
+                    let ones = self.s.m.i32(u32::MAX);
+                    let zero = self.s.m.i32(0);
+                    self.s.op(
+                        c,
+                        "quaternary.i32",
+                        Attr::ReadNone,
+                        self.s.t.i32,
+                        53,
+                        &[width, offset, ones, zero],
+                    )
+                };
+                (mask, None)
             }
             _ => return Err(name),
         };
@@ -9222,13 +9252,18 @@ impl<'a> Lower<'a> {
                 r
             }
             "v_bfm_b32" => {
-                // ((1 << src0[4:0]) - 1) << src1[4:0]
+                // Bfi masks width/offset to five bits and truncates fields
+                // crossing bit 31, matching RDNA2 `v_bfm_b32` (`Marvisak/VIctory#3525`).
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
-                let one = k(self, 1);
-                let (a, b) = (m31(self, a), m31(self, b));
-                let m = self.s.m.bin(c, Bin::Shl, one, a);
-                let m = self.s.m.bin(c, Bin::Sub, m, one);
-                self.s.m.bin(c, Bin::Shl, m, b)
+                let (ones, zero) = (k(self, u32::MAX), k(self, 0));
+                self.s.op(
+                    c,
+                    "quaternary.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    53,
+                    &[a, b, ones, zero],
+                )
             }
             "v_cvt_pk_u8_f32" => {
                 // src0 rounded to nearest even and saturated to a byte, into
@@ -10148,13 +10183,13 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
-        let has_cl = name.ends_with("_cl");
+        let has_cl = name.ends_with("_cl") || name == "image_sample_d_cl_o";
         let (op, sample) = match name {
             "image_sample" | "image_sample_o" | "image_sample_cl" => (60, true),
             "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" => (62, true),
             "image_sample_b" | "image_sample_b_cl" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" | "image_sample_d_cl" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" | "image_sample_d_cl_o" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
@@ -10405,6 +10440,9 @@ impl<'a> Lower<'a> {
                     }
                 }
                 63 if kind == 5 => {
+                    if offset_word {
+                        return Err("a cube gradient sample with a texel offset");
+                    }
                     // A cube with explicit gradients: the host wants them
                     // as changes of the direction, the console gives the
                     // changes of the face coordinates (the face is one
@@ -10437,7 +10475,10 @@ impl<'a> Lower<'a> {
                     // minus infinity, which the sampler clamps to level 0.
                     let ln = self.unary(23, texels);
                     let per_ln2 = self.s.m.f32(std::f32::consts::LOG2_E.to_bits());
-                    let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
+                    let mut lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
+                    if has_cl {
+                        lod = self.binary(35, lod, clamp);
+                    }
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(
@@ -10450,6 +10491,23 @@ impl<'a> Lower<'a> {
                     )
                 }
                 63 => {
+                    if offset_word {
+                        // DXIL `sampleGrad` requires constant immediate offsets in -8..=7 (`Marvisak/VIctory#3493`).
+                        let w = addr_val(self, 0)?;
+                        let w = self
+                            .s
+                            .m
+                            .int_value(w)
+                            .ok_or("a sample offset that is not constant")? as u32;
+                        for (k, o) in os.iter_mut().enumerate().take(offsets) {
+                            let x = (w >> (8 * k) & 0x3F) as i32;
+                            let x = if x >= 32 { x - 64 } else { x };
+                            if !(-8..=7).contains(&x) {
+                                return Err("a sample offset past -8..7");
+                            }
+                            *o = self.s.m.i32(x as u32);
+                        }
+                    }
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
                         let x = addr_packed(self, first, k)?;

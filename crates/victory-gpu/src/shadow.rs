@@ -329,10 +329,40 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 /// card later windows stay where they are. The CPU's side stays in the PC's
 /// memory, so the memory shared with the card does not shrink by this
 /// alone; what moves is what shaders read.
+/// The default of [`window_card_most`], in MiB, from the card's budget in
+/// bytes: none when it is not known; 9% of it, at most 1024 MiB, from 5 GiB
+/// on. An 8 GB card's WDDM local budget is under 8 GiB (~6.8–7.4 GiB on RX
+/// 6600 XT / RTX 4060), so starting at 5 GiB gives 8 GB PCIe x8 cards
+/// ~615–680 MiB of VRAM for title-memory windows (vertices, indices,
+/// constants) instead of reading every draw over the PCIe bus (`VIctory-RTX-Pack` `f5ebe8b`).
+fn default_window_card_mb(local_vram_budget: Option<u64>) -> u64 {
+    match local_vram_budget.map(|b| b >> 20) {
+        Some(mb) if mb >= 5 * 1024 => (mb * 9 / 100).min(1024),
+        _ => 0,
+    }
+}
+
+/// How full the card's memory may be for a window to be placed in VRAM:
+/// 90% on cards whose local budget is under 8 GiB (where textures fill 80–90%
+/// early on and would otherwise starve windows out of VRAM), 80% otherwise.
+fn window_line(budget: u64) -> u64 {
+    if budget >> 20 < 8 * 1024 {
+        budget / 10 * 9
+    } else {
+        budget / 10 * 8
+    }
+}
+
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        let asked = std::env::var("VICTORY_CARD_WINDOWS_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let budget = || crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        let mb = asked.unwrap_or_else(|| default_window_card_mb(budget()));
+        tracing::info!(window_card_mb = mb, asked = asked.is_some(), "card room for windows");
+        mb << 20
     })
 }
 
@@ -351,7 +381,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > window_line(budget)
     {
         return None;
     }
@@ -1466,6 +1496,30 @@ type Job = Box<dyn FnOnce() + Send>;
 struct Workers {
     jobs: Mutex<std::collections::VecDeque<Job>>,
     more: std::sync::Condvar,
+    /// Number of queued jobs, polled awake during [`wide_spin`].
+    there: std::sync::atomic::AtomicUsize,
+}
+
+/// Spins awake up to `VICTORY_WIDE_SPIN` microseconds (default `100`, `0`
+/// disables) waiting for `there()` before sleeping on the condvar, avoiding
+/// 50+ us OS thread wakeup latency dozens of times per frame (`VIctory-RTX-Pack` `f5ebe8b`).
+fn wide_spin(there: impl Fn() -> bool) {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let most = *MOST.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_SPIN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(100)
+    });
+    if most == 0 {
+        return;
+    }
+    let began = std::time::Instant::now();
+    while !there() && (began.elapsed().as_micros() as u64) < most {
+        for _ in 0..16 {
+            std::hint::spin_loop();
+        }
+    }
 }
 
 /// Number of worker threads for `wide` (`VICTORY_WIDE_THREADS`, clamped `1..=16`,
@@ -1482,6 +1536,7 @@ fn workers() -> &'static Workers {
     let workers = WORKERS.get_or_init(|| Workers {
         jobs: Mutex::new(std::collections::VecDeque::new()),
         more: std::sync::Condvar::new(),
+        there: std::sync::atomic::AtomicUsize::new(0),
     });
     STARTED.call_once(|| {
         let cpus = std::thread::available_parallelism().map_or(8, |n| n.get());
@@ -1492,9 +1547,11 @@ fn workers() -> &'static Workers {
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {
+                        wide_spin(|| workers.there.load(Ordering::Acquire) > 0);
                         let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
                             if let Some(job) = jobs.pop_front() {
+                                workers.there.fetch_sub(1, Ordering::AcqRel);
                                 break job;
                             }
                             jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
@@ -1518,7 +1575,8 @@ fn wide(jobs: Vec<Job>) {
         return;
     }
     let workers = workers();
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    let count = jobs.len();
+    let left = Arc::new((Mutex::new(count), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
@@ -1532,10 +1590,18 @@ fn wide(jobs: Vec<Job>) {
                 }
             }));
         }
+        workers.there.fetch_add(count, Ordering::AcqRel);
     }
     workers.more.notify_all();
     loop {
-        let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+        let job = {
+            let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            let j = queue.pop_front();
+            if j.is_some() {
+                workers.there.fetch_sub(1, Ordering::AcqRel);
+            }
+            j
+        };
         match job {
             Some(job) => job(),
             None => break,
@@ -2419,6 +2485,7 @@ pub(crate) fn let_go_idle() {
         idle.into_iter().filter_map(|key| map.remove(&key)).collect()
     };
     if !gone.is_empty() {
+        lookup_changed();
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
         crate::host::trail(|| {
             format!("sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
@@ -3728,6 +3795,73 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Bumped whenever the result of [`find`] may differ from a cached call:
+/// a buffer registered or released, an in-place shadow dropped, a loose
+/// window swept, or a shadow first made (`Marvisak/VIctory#3535`).
+static LOOKUP_GEN: AtomicU64 = AtomicU64::new(0);
+
+fn lookup_changed() {
+    LOOKUP_GEN.fetch_add(1, Ordering::Release);
+}
+
+const LOOKUP_CACHE_ENTRIES: usize = 8;
+
+/// Per-thread ring cache of exact `(address, len) -> Weak<Shadow>` queries
+/// (`VICTORY_LOOKUP_CACHE`, on by default; `=0` disables). Uses `Weak` so
+/// cached loose windows never pin `Arc::strong_count > 1` during `let_go_idle`.
+struct LookupCache {
+    epoch: u64,
+    entries: [(u64, u64); LOOKUP_CACHE_ENTRIES],
+    arcs: [Option<std::sync::Weak<Shadow>>; LOOKUP_CACHE_ENTRIES],
+    next: usize,
+}
+
+impl LookupCache {
+    const fn new() -> Self {
+        Self {
+            epoch: u64::MAX,
+            entries: [(0, 0); LOOKUP_CACHE_ENTRIES],
+            arcs: [const { None }; LOOKUP_CACHE_ENTRIES],
+            next: 0,
+        }
+    }
+
+    fn validate(&mut self) {
+        let g = LOOKUP_GEN.load(Ordering::Acquire);
+        if self.epoch != g {
+            self.epoch = g;
+            self.entries = [(0, 0); LOOKUP_CACHE_ENTRIES];
+            self.arcs = [const { None }; LOOKUP_CACHE_ENTRIES];
+            self.next = 0;
+        }
+    }
+
+    fn get(&mut self, address: u64, len: u64) -> Option<Arc<Shadow>> {
+        self.validate();
+        self.entries
+            .iter()
+            .position(|&(a, l)| a == address && l == len)
+            .and_then(|i| self.arcs[i].as_ref()?.upgrade())
+    }
+
+    fn insert(&mut self, address: u64, len: u64, shadow: &Arc<Shadow>) {
+        self.validate();
+        let i = self.next % LOOKUP_CACHE_ENTRIES;
+        self.entries[i] = (address, len);
+        self.arcs[i] = Some(Arc::downgrade(shadow));
+        self.next = self.next.wrapping_add(1);
+    }
+}
+
+fn lookup_cache_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOKUP_CACHE").is_none_or(|v| v != "0"))
+}
+
+thread_local! {
+    static FIND_CACHE: std::cell::RefCell<LookupCache> = const { std::cell::RefCell::new(LookupCache::new()) };
+}
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
     buffers().insert(
@@ -3737,11 +3871,14 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    lookup_changed();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    if buffers().remove(&(start, resource)).is_some() {
+        lookup_changed();
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -3782,6 +3919,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         }
     }
     let n = gone.len() as u64;
+    if n > 0 {
+        lookup_changed();
+    }
     for shadow in gone {
         crate::host::retire(shadow);
     }
@@ -3802,6 +3942,15 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if lookup_cache_on() {
+        if let Some(hit) = FIND_CACHE.with_borrow_mut(|c| c.get(address, len)) {
+            hit.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(hit);
+        }
+        let found = lookup(address, len, false)?;
+        FIND_CACHE.with_borrow_mut(|c| c.insert(address, len, &found));
+        return Some(found);
+    }
     lookup(address, len, false)
 }
 
@@ -3893,10 +4042,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let big = cards() && size >= card_limits().0;
         if let Some(placed) = crate::inplace::place_constants(key.0, len, fresh) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            lookup_changed();
             return entry.shadow.clone();
         }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            lookup_changed();
             return entry.shadow.clone();
         }
         let (buffer, data) = host()?.shared_buffer(size)?;
@@ -4728,6 +4879,21 @@ mod card_merge_tests {
         // older card byte is taken for a shader's write.
         let before = land(7);
         assert_eq!(before[title_byte], content[title_byte]);
+    }
+
+    #[test]
+    fn card_window_defaults_cover_8gb_vram_cards() {
+        use super::{default_window_card_mb, window_line};
+        const GIB: u64 = 1 << 30;
+        assert_eq!(default_window_card_mb(None), 0);
+        assert_eq!(default_window_card_mb(Some(4 * GIB)), 0);
+        assert_eq!(default_window_card_mb(Some(6 * GIB)), 552);
+        // 8 GB card typical WDDM local budget (~6.8-7.4 GiB) gets ~617-680 MiB + 90% threshold.
+        assert_eq!(default_window_card_mb(Some(6861 << 20)), 617);
+        assert_eq!(window_line(6861 << 20), (6861 << 20) / 10 * 9);
+        assert_eq!(default_window_card_mb(Some(8 * GIB)), 737);
+        assert_eq!(window_line(12 * GIB), (12 * GIB) / 10 * 8);
+        assert_eq!(default_window_card_mb(Some(24 * GIB)), 1024);
     }
 }
 

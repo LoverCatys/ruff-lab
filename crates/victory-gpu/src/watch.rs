@@ -666,7 +666,44 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     },
 });
 
+/// `VICTORY_GUARDS_SPIN=N`: spins awake up to `N` microseconds (default `30`;
+/// `0` disables) trying to acquire `GUARDS` before sleeping. The lock is taken
+/// hundreds of times per frame and held for a few microseconds, so spinning
+/// avoids costly OS thread sleep/wakeup stalls on title recording threads.
+fn guards_spun() -> Option<std::sync::MutexGuard<'static, Guards>> {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let most = *MOST.get_or_init(|| {
+        std::env::var("VICTORY_GUARDS_SPIN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(30)
+    });
+    if most == 0 {
+        return None;
+    }
+    if let Ok(g) = GUARDS.try_lock() {
+        return Some(g);
+    }
+    let began = std::time::Instant::now();
+    loop {
+        for _ in 0..64 {
+            std::hint::spin_loop();
+        }
+        match GUARDS.try_lock() {
+            Ok(g) => return Some(g),
+            Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if began.elapsed().as_micros() as u64 >= most {
+            return None;
+        }
+    }
+}
+
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
+    if let Some(g) = guards_spun() {
+        return g;
+    }
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 

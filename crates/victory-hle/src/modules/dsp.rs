@@ -9,18 +9,18 @@
 //! the title checks it one block later and treats a late command as an
 //! overrun. Commands complete when submitted here.
 //!
-//! The transforms themselves are not computed: the hardware takes impulse
-//! responses already in its own partitioned frequency-domain layout, which
-//! is not known. Outputs are silence, so reverb returns are dry.
-// shortcut: no convolution or block transform; outputs are zeros. Needs the
-// coprocessor's impulse response and spectrum layouts to do better.
+//! With `VICTORY_DSP_CONVOLUTION=1`, the host decodes the partitioned impulse
+//! response and renders convolution streams (filtered phone/radio/aircraft
+//! dialogue). Other transforms and streams without a usable filter use the
+//! silent fallback.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
+use super::dsp_convolve::Convolver;
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
@@ -30,11 +30,20 @@ const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 
 const CONVOLUTION: u32 = 1;
 /// Option bits that need a stereo stream, and one convolution refuses.
-const STEREO_OPTIONS: u32 = 2 | 8;
+const DEINTERLEAVED: u32 = 2;
+const STEREO_IR: u32 = 8;
+const STEREO_OPTIONS: u32 = DEINTERLEAVED | STEREO_IR;
 const NOT_FOR_CONVOLUTION: u32 = 4;
+const SAMPLE_RATE: usize = 48_000;
+const MAX_BLOCK_SAMPLES: usize = 0x800;
+
+static HOST_CONVOLUTION: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("VICTORY_DSP_CONVOLUTION").is_some_and(|value| value == "1"));
 
 pub struct Dsp {
     max_streams: u32,
+    ir_seconds: usize,
+    base_length: usize,
     active: Mutex<u32>,
 }
 
@@ -62,7 +71,8 @@ pub struct Stream {
     dsp: *mut Dsp,
     frames: u32,
     channels: u32,
-    lock: Mutex<()>,
+    deinterleaved: bool,
+    convolver: Mutex<Option<Convolver>>,
     status: Box<Status>,
 }
 
@@ -103,6 +113,8 @@ pub extern "system" fn XDspConnectWithMaximumStreamLimit(
     );
     let dsp = Box::new(Dsp {
         max_streams,
+        ir_seconds: ir_seconds as usize,
+        base_length: base_length as usize,
         active: Mutex::new(0),
     });
     // SAFETY: checked non-null.
@@ -132,6 +144,61 @@ fn valid(desc: &StreamDesc) -> bool {
     shape && (options & STEREO_OPTIONS == 0 || channels == 2)
 }
 
+#[cfg(windows)]
+fn read_samples(source: *const f32, samples: &mut [f32]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    if source.is_null() {
+        return false;
+    }
+    let bytes = size_of_val(samples);
+    let mut read = 0;
+    // SAFETY: Windows validates the source in this process. The destination
+    // is an owned slice with exactly `bytes` bytes available.
+    let result = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            source.cast(),
+            samples.as_mut_ptr().cast(),
+            bytes,
+            &mut read,
+        )
+    };
+    result != 0 && read == bytes
+}
+
+#[cfg(not(windows))]
+fn read_samples(_source: *const f32, _samples: &mut [f32]) -> bool {
+    false
+}
+
+fn make_convolver(dsp: &Dsp, desc: &StreamDesc) -> Option<Convolver> {
+    let frames = desc.frames as usize;
+    let channels = desc.channels as usize;
+    let stereo = desc.options & STEREO_IR != 0;
+    let ir_floats = desc.ir_floats as usize;
+    let partition = 2 * frames;
+    // Round the declared IR duration up to a filter partition, plus the
+    // trailing metadata partition used by the console.
+    let maximum = 2 * (dsp.ir_seconds * SAMPLE_RATE).next_multiple_of(frames) + partition;
+    let total = ir_floats.checked_mul(if stereo { channels } else { 1 })?;
+    if ir_floats < partition
+        || ir_floats > maximum
+        || total > dsp.base_length / size_of::<f32>()
+        || desc.ir.is_null()
+    {
+        return None;
+    }
+    let mut ir = Vec::new();
+    ir.try_reserve_exact(total).ok()?;
+    ir.resize(total, 0.0f32);
+    if !read_samples(desc.ir, &mut ir) {
+        return None;
+    }
+    Convolver::new(&ir, ir_floats, frames, channels, stereo)
+}
+
 pub extern "system" fn XDspActivate(
     dsp: *mut Dsp,
     desc: *const StreamDesc,
@@ -157,20 +224,26 @@ pub extern "system" fn XDspActivate(
         channels,
         "audio DSP stream activated"
     );
+    // SAFETY: a connection from `XDspConnectWithMaximumStreamLimit`.
+    let connection = unsafe { &*dsp };
     {
-        // SAFETY: a connection from `XDspConnectWithMaximumStreamLimit`.
-        let dsp = unsafe { &*dsp };
-        let mut active = dsp.active.lock().unwrap_or_else(|e| e.into_inner());
-        if *active >= dsp.max_streams {
+        let mut active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
+        if *active >= connection.max_streams {
             return E_OUTOFMEMORY;
         }
         *active += 1;
     }
+    let convolver = if kind == CONVOLUTION && *HOST_CONVOLUTION {
+        make_convolver(connection, desc)
+    } else {
+        None
+    };
     let new = Box::new(Stream {
         dsp,
         frames: desc.frames,
         channels: desc.channels,
-        lock: Mutex::new(()),
+        deinterleaved: options & DEINTERLEAVED != 0,
+        convolver: Mutex::new(convolver),
         status: Box::new(Status {
             submitted: AtomicU32::new(0),
             completed: AtomicU32::new(0),
@@ -198,7 +271,36 @@ pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
     S_OK
 }
 
-/// Completes the command at once: its output block is silence.
+fn write_convolution(
+    convolver: &mut Option<Convolver>,
+    deinterleaved: bool,
+    command: &Command,
+    samples: usize,
+) -> bool {
+    let Some(convolver) = convolver.as_mut() else {
+        return false;
+    };
+    if samples > MAX_BLOCK_SAMPLES {
+        return false;
+    }
+    let mut input = [0.0f32; MAX_BLOCK_SAMPLES];
+    let mut output = [0.0f32; MAX_BLOCK_SAMPLES];
+    let input = &mut input[..samples];
+    let output = &mut output[..samples];
+    if !read_samples(command.input, input)
+        || !convolver.process(input, output, command.gains, deinterleaved, deinterleaved)
+    {
+        return false;
+    }
+    for sample in output.iter_mut() {
+        *sample = if sample.is_finite() { sample.clamp(-1.0, 1.0) } else { 0.0 };
+    }
+    // SAFETY: the title's output buffer holds one block of the stream.
+    unsafe { std::ptr::copy(output.as_ptr(), command.output, samples) };
+    true
+}
+
+/// Completes the command and publishes its status.
 pub extern "system" fn XDspSubmitCommand(
     stream: *mut Stream,
     command: *const Command,
@@ -208,13 +310,15 @@ pub extern "system" fn XDspSubmitCommand(
         return E_INVALIDARG;
     }
     // SAFETY: a stream from `XDspActivate`, the title's command; shared ref
-    // synchronized via `stream.lock` to avoid cross-thread `&mut` UB (PR #3319).
+    // synchronized via `stream.convolver` mutex to avoid cross-thread `&mut` UB (PR #3319).
     let (stream, command) = unsafe { (&*stream, &*command) };
-    let _guard = stream.lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut convolver = stream.convolver.lock().unwrap_or_else(|e| e.into_inner());
     if !command.output.is_null() {
         let samples = (stream.frames * stream.channels) as usize;
-        // SAFETY: the title's output buffer holds one block of the stream.
-        unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+        if !write_convolution(&mut convolver, stream.deinterleaved, command, samples) {
+            // SAFETY: the title's output buffer holds one block of the stream.
+            unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+        }
     }
     let next = stream.status.submitted.load(Ordering::Relaxed).wrapping_add(1);
     stream.status.submitted.store(next, Ordering::Release);
@@ -244,6 +348,44 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn convolution_accepts_a_bounded_impulse_and_processes_in_place() {
+        let mut pulse = [0.0f32; 0x200];
+        pulse[0] = 1.0;
+        let ir = crate::modules::dsp_convolve::encode_ir(&pulse, 0x200);
+        let dsp = Dsp {
+            max_streams: 1,
+            ir_seconds: 1,
+            base_length: 0x10_0000,
+            active: Mutex::new(0),
+        };
+        let mut desc = StreamDesc {
+            kind: CONVOLUTION,
+            options: 0,
+            frames: 0x200,
+            channels: 1,
+            ir_floats: ir.len() as u32,
+            ir: ir.as_ptr(),
+        };
+        let mut convolver = make_convolver(&dsp, &desc);
+        let mut samples = [0.25f32; 0x200];
+        let mut reference = make_convolver(&dsp, &desc).unwrap();
+        let mut expected = [0.0f32; 0x200];
+        assert!(reference.process(&samples, &mut expected, [1.0; 2], false, false));
+        assert!(expected.iter().any(|sample| sample.abs() > 0.1));
+        let command = Command {
+            gains: [1.0; 2],
+            input: samples.as_ptr(),
+            output: samples.as_mut_ptr(),
+            reserved: 0,
+        };
+        assert!(write_convolution(&mut convolver, false, &command, samples.len()));
+        assert_eq!(samples, expected);
+        desc.ir_floats = u32::MAX;
+        assert!(make_convolver(&dsp, &desc).is_none());
+    }
 
     #[test]
     fn convolution_stream_as_the_title_drives_it() {

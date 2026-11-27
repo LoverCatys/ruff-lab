@@ -23,9 +23,11 @@ use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
+
+use super::dstorage_cache::{self, FileId};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xmem::PageRuns;
@@ -89,9 +91,14 @@ extern "system" fn add_ref_instance<T>(this: *const Instance<T>) -> u32 {
 }
 
 extern "system" fn release<T>(this: *mut Instance<T>) -> u32 {
+    release_with(this, || {})
+}
+
+fn release_with<T>(this: *mut Instance<T>, on_last: impl FnOnce()) -> u32 {
     // SAFETY: as above.
     let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
+        on_last();
         // SAFETY: the last reference; created by `Instance::create`.
         drop(unsafe { Box::from_raw(this) });
     }
@@ -128,12 +135,13 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
     const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
-    if path.is_null() {
+    if path.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
     let overlapped = overlapped_reads();
     let flags = if overlapped { FILE_FLAG_OVERLAPPED } else { 0 };
-    // Goes through `files`, so paths on our virtual drives work too.
+    let on_ssd = super::files::is_ssd_overlay_path(path);
+    // Goes through `files`, so paths on our virtual drives and SSD overlay work too.
     let handle = super::files::CreateFileW(
         path,
         GENERIC_READ,
@@ -153,15 +161,20 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
-    let kept = name.clone();
-    tracing::info!(path = name, iid = iid_text(iid), overlapped, "dstorage: file opened");
+    tracing::info!(path = name, iid = iid_text(iid), overlapped, on_ssd, "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    let id = FileId::from_open(&name, &file, on_ssd);
     let file = Instance::create(
         Object::new("dstorage file", &FILE_VTABLE),
-        File { file, overlapped },
+        File { file, overlapped, id },
     );
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
+    if walls_trace() != 0 {
+        WALLS_FILES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(file as usize, name);
+    }
     put(out, file)
 }
 
@@ -276,12 +289,24 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 struct File {
     file: std::fs::File,
     overlapped: bool,
+    id: FileId,
+}
+
+extern "system" fn release_file(this: *mut Instance<File>) -> u32 {
+    release_with(this, || {
+        if walls_trace() != 0 {
+            WALLS_FILES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(this as usize));
+        }
+    })
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<File> as *const (),
-    release::<File> as *const (),
+    release_file as *const (),
     missing::<3> as *const (),
     missing::<4> as *const (),
     missing::<5> as *const (),
@@ -488,9 +513,8 @@ fn walls_trace() -> u8 {
     })
 }
 
-/// The files opened, by the address of our file object, with their paths
-/// (for the walls trace: a request names its file by that address).
-static WALLS_FILES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+/// Paths of live file objects while the walls trace is enabled.
+static WALLS_FILES: LazyLock<Mutex<HashMap<usize, String>>> = LazyLock::new(Default::default);
 
 /// The walls trace's line for a request that is done.
 fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::time::Instant) {
@@ -503,7 +527,7 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     } else {
         let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
         let source = request.source as usize;
-        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
+        files.get(&source).cloned().unwrap_or_else(|| "?".to_string())
     };
     let hr = match result {
         Ok(()) => 0,
@@ -985,12 +1009,61 @@ fn execute(request: &Request, pages: Option<&PageRuns>) -> Result<(), HRESULT> {
         return Err(fail(E_INVALIDARG, "no source or destination"));
     }
     let bc = ((options & BCPACK) >> 1) as u8;
+    let compressed = options & (ZLIB | BCPACK) != 0;
     let size = request.destination_size as usize;
-    if options & (ZLIB | BCPACK) == 0 {
+    let raw_size = request.source_size as usize;
+
+    // Optional persistent decompressed SSD cache lookup (file-backed requests only).
+    let cache_entry = if options & MEMORY_SOURCE == 0
+        && dstorage_cache::should_cache(compressed, raw_size, size)
+        && let Some(cache) = dstorage_cache::global()
+    {
+        // SAFETY: `source` is our live `Instance<File>`.
+        let file_id = unsafe { &*request.source.cast::<Instance<File>>() }.state.id;
+        let key = dstorage_cache::make_key(
+            file_id.hash,
+            request.offset,
+            request.source_size,
+            request.destination_size,
+            options & (ZLIB | BCPACK),
+            request.intermediate_size,
+        );
+        let cap = if compressed { size } else { raw_size };
+        thread_local! {
+            static HIT_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let hit = HIT_SCRATCH.with_borrow_mut(|scratch| {
+            if scratch.len() < cap {
+                scratch.resize(cap, 0);
+            }
+            if let Some(hit_len) = cache.get(&key, &mut scratch[..cap]) {
+                let res = into_destination(request, pages, hit_len, |out| {
+                    out.copy_from_slice(&scratch[..hit_len]);
+                    Ok(hit_len)
+                });
+                // Avoid retaining a huge 64 MiB thread-local scratch indefinitely.
+                if scratch.capacity() > (4 << 20) {
+                    scratch.clear();
+                    scratch.shrink_to(1 << 20);
+                }
+                Some(res)
+            } else {
+                None
+            }
+        });
+        if let Some(res) = hit {
+            return res.map_err(|hr| fail(hr, "ssd cache hit"));
+        }
+        Some((cache, key))
+    } else {
+        None
+    };
+
+    if !compressed {
         if request.source_size > request.destination_size {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
-        let size = request.source_size as usize;
+        let size = raw_size;
         // A file read into a title address is the kernel's write, and the
         // kernel does not fault into the GPU side's guard: a block guarded
         // again between `kernel_will_write` and the read (the guard over all
@@ -1002,10 +1075,17 @@ fn execute(request: &Request, pages: Option<&PageRuns>) -> Result<(), HRESULT> {
         let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
         return into_destination(request, pages, size, |out| {
             if !bounce {
-                return read_into(request, out).map(|()| size);
+                read_into(request, out)?;
+                if let Some((cache, key)) = cache_entry {
+                    cache.put_async(key, out);
+                }
+                return Ok(size);
             }
             let mut data = vec![0; size];
             read_into(request, &mut data)?;
+            if let Some((cache, key)) = cache_entry {
+                cache.put_async(key, &data);
+            }
             out.copy_from_slice(&data);
             Ok(size)
         })
@@ -1022,11 +1102,17 @@ fn execute(request: &Request, pages: Option<&PageRuns>) -> Result<(), HRESULT> {
     } else {
         source
     };
-    into_destination(request, pages, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+    into_destination(request, pages, size, |out| {
+        let produced = match tables {
+            Some(tables) => bcpack::decode(bc, &source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+            None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        }?;
+        if let Some((cache, key)) = cache_entry {
+            cache.put_async(key, &out[..produced]);
+        }
+        Ok(produced)
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -1184,6 +1270,9 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     }
     // SAFETY: a file object we created; the title keeps it open.
     let file_obj = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
+    // Throttle concurrent seeks on rotational HDD misses while letting SSD
+    // hits and CPU decompression scale across all DirectStorage workers.
+    let _hdd_permit = dstorage_cache::acquire_hdd_permit(file_obj.id.on_ssd);
     let started = std::time::Instant::now();
     let result = if file_obj.overlapped {
         use std::os::windows::io::AsRawHandle;

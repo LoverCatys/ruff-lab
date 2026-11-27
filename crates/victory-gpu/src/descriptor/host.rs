@@ -807,17 +807,30 @@ impl TextureQueue {
     ///   first 3D frames).
     #[cfg(test)]
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        Self::in_order(self.all_due(frame), max)
+        Self::in_order(self.snapshot(frame, true).0, max)
     }
 
-    /// Collects the slots due at `frame` under the queue lock; sorting runs
-    /// lock-free in [`TextureQueue::in_order`] (`kitty-core/Kitty6` `11511b8`).
-    fn all_due(&self, frame: u64) -> Due {
+    /// Collects the slots due at `frame` and the queue's counts in one pass
+    /// under the queue lock (`Vice-Tay#248`); sorting runs lock-free in
+    /// [`TextureQueue::in_order`].
+    fn snapshot(&self, frame: u64, collect_slots: bool) -> (Due, [u64; 5]) {
         let mut due = Due::default();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            due[usize::from(w.looks == 0 && w.mapped == 0)].push((w.written, index, w.write));
+        let mut counts = [self.slots.len() as u64, 0, 0, 0, 0];
+        for (&index, w) in &self.slots {
+            if w.mapped > 0 {
+                counts[3] += 1;
+            } else if w.looks > 0 {
+                counts[2] += 1;
+            }
+            if w.due <= frame {
+                counts[1] += 1;
+                counts[4] = counts[4].max(frame.saturating_sub(w.written));
+                if collect_slots {
+                    due[usize::from(w.looks == 0 && w.mapped == 0)].push((w.written, index, w.write));
+                }
+            }
         }
-        due
+        (due, counts)
     }
 
     fn in_order([mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
@@ -937,6 +950,7 @@ impl TextureQueue {
     /// For the frame line: slots in the queue; of them due at `frame`;
     /// waiting for their memory (looked at, never uploaded); uploaded in
     /// part; and the frames the oldest due one has waited since its write.
+    #[cfg(test)]
     fn census(&self, frame: u64) -> [u64; 5] {
         let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
         for w in self.slots.values() {
@@ -1528,19 +1542,11 @@ impl HostHeap {
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
     /// with its write number, in the order to serve them
-    /// ([`TextureQueue::due`]), and the queue's counts
-    /// ([`TextureQueue::census`]).
+    /// ([`TextureQueue::in_order`]), and the queue's counts (`Vice-Tay#248`).
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let (due, census) = {
             let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            (
-                if max == 0 {
-                    Due::default()
-                } else {
-                    textures.all_due(frame)
-                },
-                textures.census(frame),
-            )
+            textures.snapshot(frame, max != 0)
         };
         (TextureQueue::in_order(due, max), census)
     }

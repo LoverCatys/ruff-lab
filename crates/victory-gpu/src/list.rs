@@ -279,8 +279,14 @@ fn fresh_list() -> Option<crate::host::HostList> {
     }
 }
 
+/// Host lists kept idle while an RDNA2 aperture segment is near its limit
+/// (`crate::host::segments`; `klbf-lab` `680c779`).
+#[cfg(windows)]
+const IDLE_WHEN_TIGHT: usize = 64;
+
 /// Releases idle recycled host lists (each holds command allocators in L0
-/// shared GPU memory) under memory pressure or during OOM recovery.
+/// shared GPU memory / RDNA2 2 GB aperture) under memory pressure, tight
+/// aperture, or during OOM recovery.
 #[cfg(windows)]
 pub(crate) fn trim_idle(force: bool) {
     let keep = if force {
@@ -290,6 +296,18 @@ pub(crate) fn trim_idle(force: bool) {
     } else {
         return;
     };
+    trim_idle_to(keep);
+}
+
+/// Caps idle recycled host lists to [`IDLE_WHEN_TIGHT`] when an RDNA2 aperture
+/// segment exceeds `VICTORY_SEGMENT_TIGHT` (`klbf-lab` `680c779`).
+#[cfg(windows)]
+pub(crate) fn trim_idle_tight() {
+    trim_idle_to(IDLE_WHEN_TIGHT);
+}
+
+#[cfg(windows)]
+fn trim_idle_to(keep: usize) {
     let gone = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() <= keep {
@@ -329,6 +347,41 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
+    }
+}
+
+/// Returns host command lists of a landed flight to [`IDLE`] immediately
+/// while retiring what their commands named (`_state`, `_uploads`, held host
+/// objects) through `crate::host::retire` for the bury lag (`klbf-lab` `867330f`).
+/// Keeps RDNA2 aperture command-allocator memory bounded instead of holding
+/// ~700 host lists in flight across 64 submissions.
+#[cfg(windows)]
+pub(crate) fn recycle_landed(lists: Vec<Detached>, ran: &[usize]) {
+    if !pools() {
+        crate::host::retire(lists);
+        return;
+    }
+    let mut retired_held = Vec::with_capacity(lists.len());
+    for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
+        let held = host.take_held();
+        retired_held.push((_state, _uploads, held));
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+            crate::host::retire(host);
+            continue;
+        }
+        host.reset();
+        let bytes = host.scratch_kept();
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+            idle.0.push(Idle(host, bytes));
+            idle.1 += bytes;
+        } else {
+            drop(idle);
+            crate::host::retire(host);
+        }
+    }
+    if !retired_held.is_empty() {
+        crate::host::retire(retired_held);
     }
 }
 

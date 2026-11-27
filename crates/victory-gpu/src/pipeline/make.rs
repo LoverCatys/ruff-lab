@@ -35,6 +35,8 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// When a worker began it ([`slow`]).
     begun: OnceLock<Instant>,
+    /// Microseconds frames have waited for this pipeline in all (`VICTORY_PIPELINE_WAIT_CAP_MS`).
+    waited_us: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -69,6 +71,7 @@ impl Pending {
             made: OnceLock::new(),
             used: AtomicBool::new(false),
             begun: OnceLock::new(),
+            waited_us: AtomicU64::new(0),
         }
     }
 
@@ -235,10 +238,29 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Total time frames wait for one never-made pipeline across the run
+/// (`VICTORY_PIPELINE_WAIT_CAP_MS`, default 5000 ms; 0: unlimited;
+/// `klbf-lab` `4c79ac5`). Prevents a broken/stalled PSO from eating 500 ms
+/// of every single frame.
+fn wait_cap() -> Duration {
+    static CAP: OnceLock<Duration> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let ms = std::env::var("VICTORY_PIPELINE_WAIT_CAP_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(5000);
+        Duration::from_millis(ms)
+    })
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let budget = wait_budget();
     if budget.is_zero() || slow(p) {
+        return;
+    }
+    let cap = wait_cap();
+    if !cap.is_zero() && Duration::from_micros(p.waited_us.load(Ordering::Relaxed)) >= cap {
         return;
     }
     // What was waited past the budget since the start, in milliseconds; the
@@ -285,6 +307,8 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    p.waited_us
+        .fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
     let past = waited.saturating_sub(wait_budget());
     past_total.fetch_add(past.as_millis() as u64, Ordering::Relaxed);
     {
