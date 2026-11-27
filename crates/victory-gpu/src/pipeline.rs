@@ -76,8 +76,97 @@ pub(crate) struct Shader {
     /// prevents RT-only host textures/UAVs from being allocated on 8 GB VRAM.
     #[cfg(windows)]
     skip_rt: bool,
+    /// Heavy graphics pass skipped in `VICTORY_LOW_GRAPHICS=1` (shadow maps,
+    /// reflections, SSR, voxel GI, puddle/glare/heat distortion) or `=2`
+    /// (volumetric fog/clouds, shadow blur, hair blur). Keeps main GBuffer,
+    /// sky dome (`ps_sky_paraboloid_reflection`), `PS_ShadowRender`, lighting,
+    /// `CS_ScreenProbes_TemporalResolve`, `CS_UpdateHistory` and UI untouched.
+    #[cfg(windows)]
+    skip_low: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+}
+
+/// Shadow-map rasterization, reflection scene redraws, SSR, voxel GI and
+/// auxiliary distortion passes skipped under `VICTORY_LOW_GRAPHICS=1`.
+#[cfg(windows)]
+const LOW_GRAPHICS_SKIP_PATTERNS: &[&[u8]] = &[
+    // Shadow-map geometry rasterization & culling (leaves cleared shadow maps
+    // so `PS_ShadowRender` renders cleanly lit without shadows).
+    b"CascadeShadows",
+    b"MS_VS_Cascade_Transform",
+    b"VS_PNTri_Cascade",
+    b"PS_shadow",
+    b"VS_shadow",
+    b"PS_CableShadow",
+    b"VS_Cable_LocalShadow",
+    b"PS_ImposterShadow",
+    b"VS_TransformShadowModel",
+    b"PS_CopyToShadowMapVS",
+    b"ParaboloidShadows",
+    b"CS_RTDistantShadow",
+    b"CS_TraceShadowRays",
+    // Planar, mirror, water & screen-space reflections (keeps lowercase
+    // `ps_sky_paraboloid_reflection` and `CS_UpdateHistory` for `ambient.rs`).
+    b"MirrorReflection",
+    b"PS_MirrorPedTextured",
+    b"ReflectionGBuffer",
+    b"WaterReflection",
+    b"PS_TexturedLit_ReflectionMap",
+    b"PS_ResolvePortalReflection",
+    b"BatchCullReflect",
+    b"CS_CombinedReflections",
+    b"_SSR",
+    b"GBufferSSR",
+    // World voxelization & GI probe ray passes (output replaced by `ambient.rs`).
+    b"PS_VoxelizeVisiblity",
+    b"VS_VoxelizeGeneric",
+    b"GS_VoxelizeGeneric",
+    b"CS_EntityCoarseVoxelization",
+    b"CS_ScreenProbes_TraceRays_",
+    b"CS_ScreenProbes_ResolveRays_",
+    b"CS_ScreenProbes_GenerateRayBins",
+    b"CS_ScreenProbes_GenerateShaderBins",
+    // Puddle reflection detection, heat distortion, glare blur & grass trails.
+    b"PS_PuddleDetect",
+    b"PS_HeatHaze",
+    b"GlareBlurPass",
+    b"GrassFlatten",
+];
+
+/// Additional volumetric fog/cloud and blur passes skipped under
+/// `VICTORY_LOW_GRAPHICS=2` (ultra-low / potato). Clear passes are kept so
+/// volumetric targets remain cleanly zeroed.
+#[cfg(windows)]
+const POTATO_SKIP_PATTERNS: &[&[u8]] = &[
+    b"VS_FogVolumeProxy",
+    b"PS_FogVolumeProxy",
+    b"CS_WorldSpaceFogVolumeClusters",
+    b"CS_FogVolumeMixer",
+    b"CS_RayMiss_Volumetrics",
+    b"CS_ResolveVolumetrics",
+    b"CS_TransmissionVolumetrics_Tiled",
+    b"CS_TransmissionVolumetricsTemporal",
+    b"CS_TransmissionVolumetricsSubmerged",
+    b"CS_TransmissionVolumetrics_VolumePortalsOnly",
+    b"CS_TransmissionVolumetrics_GenerateTiles",
+    b"CS_CloudDensityField",
+    b"CS_CloudMultiScatteringCache",
+    b"VS_TiledHairBlur",
+    b"PS_ShadowBlur",
+];
+
+#[cfg(windows)]
+fn matches_low_graphics_skip(bytes: &[u8], level: u8) -> bool {
+    if level == 0 {
+        return false;
+    }
+    let hit = |patterns: &[&[u8]]| {
+        patterns
+            .iter()
+            .any(|pat| bytes.windows(pat.len()).any(|w| w == *pat))
+    };
+    hit(LOW_GRAPHICS_SKIP_PATTERNS) || (level >= 2 && hit(POTATO_SKIP_PATTERNS))
 }
 
 /// Ray-tracing shaders and ray-request feeder programs that waste GPU time and
@@ -188,6 +277,8 @@ impl Shader {
                 .any(|w| w == crate::ambient::REFLECTED),
             #[cfg(windows)]
             skip_rt: skip_rt_enabled() && matches_rt_skip(bytes),
+            #[cfg(windows)]
+            skip_low: matches_low_graphics_skip(bytes, crate::host::low_graphics()),
             #[cfg(windows)]
             translated: OnceLock::new(),
         }
@@ -514,12 +605,13 @@ fn skipped_shader(shaders: &[Arc<Shader>]) -> Option<&str> {
             .unwrap_or_else(|_| "39f0e9aeb156a61c".to_owned());
         parse_skip_hashes(&value)
     });
-    if hashes.is_empty() {
-        return None;
-    }
     shaders
         .iter()
-        .find(|shader| shader.skip_rt || hashes.contains(&shader.hash))
+        .find(|shader| {
+            shader.skip_rt
+                || shader.skip_low
+                || (!hashes.is_empty() && hashes.contains(&shader.hash))
+        })
         .map(|shader| shader.hash.as_str())
 }
 
@@ -938,6 +1030,59 @@ mod tests {
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn low_graphics_skip_matches_shadows_and_reflections_only() {
+        // Level 0 disables all low-graphics skipping.
+        assert!(!super::matches_low_graphics_skip(b"MS_VS_CascadeShadows_draw", 0));
+        assert!(!super::matches_low_graphics_skip(b"CS_FogVolumeMixer", 0));
+
+        // Level 1 skips shadow-map draws, reflections/SSR, voxel GI & puddles.
+        for name in [
+            b"MS_VS_CascadeShadows_draw".as_slice(),
+            b"PS_MirrorReflectionDeferredTextured".as_slice(),
+            b"CS_ResolveScreenSpace_GBufferSSR".as_slice(),
+            b"PS_VoxelizeVisiblity".as_slice(),
+            b"PS_PuddleDetect".as_slice(),
+        ] {
+            assert!(
+                super::matches_low_graphics_skip(name, 1),
+                "expected level 1 skip for {}",
+                String::from_utf8_lossy(name)
+            );
+            assert!(super::matches_low_graphics_skip(name, 2));
+        }
+
+        // Volumetrics/clouds/blur are only skipped at level 2 (potato).
+        for name in [
+            b"CS_FogVolumeMixer".as_slice(),
+            b"CS_CloudDensityField".as_slice(),
+            b"PS_ShadowBlur".as_slice(),
+        ] {
+            assert!(!super::matches_low_graphics_skip(name, 1));
+            assert!(super::matches_low_graphics_skip(name, 2));
+        }
+
+        // Critical scene, sky, lighting, SSS, clear & hair shaders must NEVER be skipped.
+        for keep in [
+            b"ps_sky_paraboloid_reflection".as_slice(),
+            b"PS_ShadowRenderNoMisc_CSM_ST_LINEAR".as_slice(),
+            b"CS_ScreenProbes_TemporalResolve".as_slice(),
+            b"CS_UpdateHistory".as_slice(),
+            b"CS_ClearFogVolumeGridTexture".as_slice(),
+            b"VS_HairStrandGeometry".as_slice(),
+            b"PS_DeferredLighting".as_slice(),
+            b"PS_SSSResolve_44ece319_Wrapped".as_slice(),
+            b"CS_SSSResolve_ae43264d_Wrapped".as_slice(),
+        ] {
+            assert!(
+                !super::matches_low_graphics_skip(keep, 2),
+                "must NOT skip critical shader {}",
+                String::from_utf8_lossy(keep)
+            );
+        }
     }
 
     use super::*;

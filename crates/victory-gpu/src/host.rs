@@ -117,6 +117,44 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
+/// Low-graphics preset (`VICTORY_LOW_GRAPHICS`):
+/// - `0` (unset / `0` / `off`): normal graphics;
+/// - `1` (`1` / `on` / `low`): skips shadow-map draws, reflection passes, SSR,
+///   voxel GI & puddle detection; disables ambient crease occlusion and clamps
+///   reflections to `0.02`; caps textures to `128 px` (+ mip drop 2, `+1.5`
+///   sampler LOD bias, 1x anisotropy); defaults display mode to `960x540`;
+/// - `2` (`2` / `ultra` / `potato`): everything in `1` plus skips volumetric
+///   fog/clouds, shadow blur and hair blur; caps textures to `64 px` (+ mip
+///   drop 3, `+3.0` sampler LOD bias, bilinear filtering); defaults display
+///   mode to `640x360`.
+pub(crate) fn low_graphics() -> u8 {
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        let level = std::env::var("VICTORY_LOW_GRAPHICS")
+            .ok()
+            .map_or(0, |v| parse_low_graphics(&v));
+        if level == 1 {
+            tracing::info!(
+                "VICTORY_LOW_GRAPHICS=1: low graphics active (no shadows, no reflections/SSR/voxels, blurry 128px textures + LOD bias, 960x540 default)"
+            );
+        } else if level >= 2 {
+            tracing::info!(
+                "VICTORY_LOW_GRAPHICS=2: ultra-low potato graphics active (no shadows/reflections/volumetrics/clouds, blurry 64px textures + strong LOD bias, 640x360 default)"
+            );
+        }
+        level
+    })
+}
+
+fn parse_low_graphics(value: &str) -> u8 {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" | "false" | "no" => 0,
+        "2" | "ultra" | "potato" | "max" => 2,
+        "1" | "on" | "true" | "low" | "yes" => 1,
+        _ => value.trim().parse::<u8>().unwrap_or(0).min(2),
+    }
+}
+
 /// Total physical RAM on the host in bytes, from `GlobalMemoryStatusEx` (cached).
 pub(crate) fn total_physical_ram() -> Option<u64> {
     static TOTAL: OnceLock<Option<u64>> = OnceLock::new();
@@ -9091,6 +9129,20 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
                     assert_eq!(out[end], 0xCC, "block {b} byte after dirty range clobbered");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn parse_low_graphics_handles_aliases_and_clamps() {
+        use super::parse_low_graphics;
+        for off in ["", "0", "off", "OFF", "false", "no", "garbage"] {
+            assert_eq!(parse_low_graphics(off), 0, "input {off:?}");
+        }
+        for low in ["1", " 1 ", "on", "ON", "true", "low", "yes"] {
+            assert_eq!(parse_low_graphics(low), 1, "input {low:?}");
+        }
+        for potato in ["2", "ultra", "POTATO", "max", "5", "99"] {
+            assert_eq!(parse_low_graphics(potato), 2, "input {potato:?}");
         }
     }
 }

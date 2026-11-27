@@ -544,10 +544,15 @@ const SLOW_SINGLE_GROUP_COMPUTE: &str = "02384a60fda6f2d0";
 fn thin_slow_compute_every() -> u64 {
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *EVERY.get_or_init(|| {
+        let default = match crate::host::low_graphics() {
+            0 => 4,
+            1 => 8,
+            _ => 16,
+        };
         std::env::var("VICTORY_THIN_SLOW_COMPUTE")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(4)
+            .unwrap_or(default)
     })
 }
 

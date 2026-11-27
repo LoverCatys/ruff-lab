@@ -1588,17 +1588,29 @@ pub(crate) fn room_for_short() -> bool {
 fn texture_max_dim() -> Option<u64> {
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
-        let value = std::env::var("VICTORY_TEXTURE_MAX_DIM").ok()?;
-        match value.trim().parse::<u64>() {
-            Ok(0) => None,
-            Ok(n @ 4..=16384) => {
-                tracing::info!(max_dim = n, "VICTORY_TEXTURE_MAX_DIM: capping sampled placed BC textures");
-                Some(n)
+        if let Ok(value) = std::env::var("VICTORY_TEXTURE_MAX_DIM") {
+            return match value.trim().parse::<u64>() {
+                Ok(0) => None,
+                Ok(n @ 4..=16384) => {
+                    tracing::info!(max_dim = n, "VICTORY_TEXTURE_MAX_DIM: capping sampled placed BC textures");
+                    Some(n)
+                }
+                _ => {
+                    tracing::warn!(value, "VICTORY_TEXTURE_MAX_DIM expects 0 or a size from 4 to 16384");
+                    None
+                }
+            };
+        }
+        match crate::host::low_graphics() {
+            1 => {
+                tracing::info!(max_dim = 128, "VICTORY_LOW_GRAPHICS=1: capping sampled placed BC textures to 128 px");
+                Some(128)
             }
-            _ => {
-                tracing::warn!(value, "VICTORY_TEXTURE_MAX_DIM expects 0 or a size from 4 to 16384");
-                None
+            2.. => {
+                tracing::info!(max_dim = 64, "VICTORY_LOW_GRAPHICS=2: capping sampled placed BC textures to 64 px");
+                Some(64)
             }
+            _ => None,
         }
     })
 }
@@ -1623,26 +1635,38 @@ fn looks_like_ui(desc: &ResourceDesc) -> bool {
 fn short_side() -> u64 {
     static SIDE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *SIDE.get_or_init(|| {
+        let default = match crate::host::low_graphics() {
+            0 => 256,
+            1 => 64,
+            _ => 32,
+        };
         std::env::var("VICTORY_TEXTURE_SHORT_SIDE")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(256, |side| side.clamp(16, 4096))
+            .map_or(default, |side| side.clamp(16, 4096))
     })
 }
 
 /// How many largest mips to omit for a title-filled 2D single-slice texture:
-/// respects `VICTORY_TEXTURE_DROP_MIPS` (0..=4 on >=512 px textures),
+/// respects `VICTORY_TEXTURE_DROP_MIPS` (0..=4 on >=512 px textures, or
+/// >=256/128 px in `VICTORY_LOW_GRAPHICS=1/2` while preserving UI),
 /// `VICTORY_TEXTURE_MAX_DIM` (on placed BC textures, preserving UI via `keep_ui`),
 /// and `ShortOfRoom` (`short_side()`, default 256 px).
 #[cfg(windows)]
 fn drop_levels(desc: &ResourceDesc, placed: bool, clear_null: bool) -> u32 {
     const TEXTURE_2D: u32 = 3;
     static ALWAYS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let low = crate::host::low_graphics();
     let always = *ALWAYS.get_or_init(|| {
+        let default = match low {
+            0 => 0,
+            1 => 2,
+            _ => 3,
+        };
         std::env::var("VICTORY_TEXTURE_DROP_MIPS")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(0)
+            .unwrap_or(default)
             .min(4)
     });
     let (width, height) = (desc.width, u64::from(desc.height));
@@ -1654,7 +1678,17 @@ fn drop_levels(desc: &ResourceDesc, placed: bool, clear_null: bool) -> u32 {
     {
         return 0;
     }
-    let mut n = if always > 0 && width.min(height) >= 512 { always } else { 0 };
+    let min_side = match low {
+        0 => 512,
+        1 => 256,
+        _ => 128,
+    };
+    let ui_protected = low > 0 && keep_ui() && looks_like_ui(desc);
+    let mut n = if always > 0 && width.min(height) >= min_side && !ui_protected {
+        always
+    } else {
+        0
+    };
     if placed
         && clear_null
         && desc.flags & 0xf == 0

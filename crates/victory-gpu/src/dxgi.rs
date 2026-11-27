@@ -231,9 +231,14 @@ fn display_size() -> (u32, u32) {
             let (w, h) = v.trim().split_once(['x', 'X'])?;
             Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
         });
+        let default = match crate::host::low_graphics() {
+            1 => (960, 540),
+            2.. => (640, 360),
+            _ => (3840, 2160),
+        };
         let size = match asked {
             Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
+            _ => default,
         };
         tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
         size

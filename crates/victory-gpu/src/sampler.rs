@@ -93,6 +93,37 @@ pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
     .host()
 }
 
+/// Applies low-graphics sampler downgrades (`VICTORY_LOW_GRAPHICS=1` or `2`):
+/// disables anisotropic filtering and adds a positive mip LOD bias on plain
+/// (non-comparison, non-min/max) multi-mip samplers for softer/blurrier
+/// textures and lower bandwidth without affecting depth/shadow/UI/LUT samplers.
+pub(crate) fn apply_low_graphics(desc: &mut D3D12_SAMPLER_DESC) {
+    apply_low_graphics_level(desc, crate::host::low_graphics());
+}
+
+fn apply_low_graphics_level(desc: &mut D3D12_SAMPLER_DESC, level: u8) {
+    if level == 0 {
+        return;
+    }
+    // Only touch plain samplers (reduction == 0); keep comparison & min/max intact.
+    if (desc.Filter.0 >> 7) != 0 {
+        return;
+    }
+    let mode = desc.Filter.0 & 0x7f;
+    if mode == 0x55 {
+        // ANISOTROPIC -> trilinear (level 1) or bilinear (level 2).
+        desc.Filter = D3D12_FILTER(if level >= 2 { 0x14 } else { 0x15 });
+        desc.MaxAnisotropy = 1;
+    } else if level >= 2 && mode == 0x15 {
+        // Trilinear -> bilinear in ultra-low potato mode.
+        desc.Filter = D3D12_FILTER(0x14);
+    }
+    if mode != 0 && desc.MaxLOD > desc.MinLOD {
+        let extra = if level >= 2 { 3.0 } else { 1.5 };
+        desc.MipLODBias = (desc.MipLODBias + extra).clamp(-16.0, 15.99);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +146,60 @@ mod tests {
         assert_eq!(console(&w).ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
         w[16] = 1;
         assert_eq!(console(&w).Filter.0, 0x5);
+    }
+
+    #[test]
+    fn low_graphics_downgrades_aniso_and_biases_plain_samplers_only() {
+        let mut aniso = D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER(0x55),
+            MaxAnisotropy: 16,
+            MipLODBias: 0.0,
+            MinLOD: 0.0,
+            MaxLOD: 1000.0,
+            ..Default::default()
+        };
+        apply_low_graphics_level(&mut aniso, 1);
+        assert_eq!(aniso.Filter.0, 0x15);
+        assert_eq!(aniso.MaxAnisotropy, 1);
+        assert!((aniso.MipLODBias - 1.5).abs() < 1e-6);
+
+        let mut potato = D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER(0x55),
+            MaxAnisotropy: 16,
+            MipLODBias: 14.0,
+            MinLOD: 0.0,
+            MaxLOD: 1000.0,
+            ..Default::default()
+        };
+        apply_low_graphics_level(&mut potato, 2);
+        assert_eq!(potato.Filter.0, 0x14);
+        assert_eq!(potato.MaxAnisotropy, 1);
+        assert!((potato.MipLODBias - 15.99).abs() < 1e-5);
+
+        // Comparison sampler must remain untouched.
+        let mut cmp = D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER(0x95),
+            MaxAnisotropy: 1,
+            MipLODBias: 0.0,
+            MinLOD: 0.0,
+            MaxLOD: 1000.0,
+            ..Default::default()
+        };
+        apply_low_graphics_level(&mut cmp, 2);
+        assert_eq!(cmp.Filter.0, 0x95);
+        assert_eq!(cmp.MipLODBias, 0.0);
+
+        // Single-mip point sampler (UI/LUT) must remain untouched.
+        let mut ui = D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER(0x0),
+            MaxAnisotropy: 1,
+            MipLODBias: 0.0,
+            MinLOD: 0.0,
+            MaxLOD: 0.0,
+            ..Default::default()
+        };
+        apply_low_graphics_level(&mut ui, 2);
+        assert_eq!(ui.Filter.0, 0x0);
+        assert_eq!(ui.MipLODBias, 0.0);
     }
 }

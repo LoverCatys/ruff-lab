@@ -85,11 +85,12 @@ fn keep() -> f32 {
     }
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| {
+        let default = if crate::host::low_graphics() > 0 { 0.02 } else { 0.5 };
         std::env::var("VICTORY_AMBIENT_REFLECT")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .filter(|k: &f32| k.is_finite() && *k >= 0.0)
-            .unwrap_or(0.5)
+            .unwrap_or(default)
     })
 }
 
@@ -173,7 +174,11 @@ fn shade() -> [f32; 4] {
     }
     static SET: OnceLock<[f32; 4]> = OnceLock::new();
     *SET.get_or_init(|| {
-        let mut shade = [1.0, 0.6, 0.1, 0.45];
+        let mut shade = if crate::host::low_graphics() > 0 {
+            [0.0, 0.6, 0.1, 0.45]
+        } else {
+            [1.0, 0.6, 0.1, 0.45]
+        };
         let set = std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default();
         for (to, v) in shade.iter_mut().zip(set.split(',')) {
             if let Ok(v) = v.trim().parse() {

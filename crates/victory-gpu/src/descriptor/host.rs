@@ -3567,17 +3567,19 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
-            let desc = unsafe {
+            let mut desc = unsafe {
                 std::ptr::from_ref(words)
                     .cast::<D3D12_SAMPLER_DESC>()
                     .read_unaligned()
             };
+            crate::sampler::apply_low_graphics(&mut desc);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
             Some(None)
         }
         View::ConsoleSampler(words) => {
-            let desc = crate::sampler::console(words);
+            let mut desc = crate::sampler::console(words);
+            crate::sampler::apply_low_graphics(&mut desc);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
             Some(None)
