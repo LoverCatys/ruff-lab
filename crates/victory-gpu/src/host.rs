@@ -117,6 +117,20 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
+/// Total physical RAM on the host in bytes, from `GlobalMemoryStatusEx` (cached).
+pub(crate) fn total_physical_ram() -> Option<u64> {
+    static TOTAL: OnceLock<Option<u64>> = OnceLock::new();
+    *TOTAL.get_or_init(|| {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: plain data the call fills in.
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: a sized structure.
+        let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+        ok.then_some(m.ullTotalPhys)
+    })
+}
+
 /// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
 pub(crate) fn available_physical_ram() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -126,6 +140,34 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
     ok.then_some(m.ullAvailPhys)
+}
+
+/// Pressure level on WDDM shared GPU memory (`DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL`,
+/// capped at ~50% of host RAM on Windows, e.g. ~7.5 GiB on 16 GB PCs), cached
+/// every 250 ms: `0` = normal (< 70%), `1` = moderate (>= 70%), `2` = high (>= 80%).
+pub(crate) fn shared_memory_pressure() -> u8 {
+    static LAST_QUARTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let quarter = now_ms() / 250 + 1;
+    if LAST_QUARTER.load(Ordering::Relaxed) == quarter {
+        return LEVEL.load(Ordering::Relaxed);
+    }
+    let level = match host().and_then(Host::video_memory) {
+        Some([_, _, budget, used]) if budget > 0 => {
+            let pct = (u128::from(used) * 100) / u128::from(budget);
+            if pct >= 80 {
+                2
+            } else if pct >= 70 {
+                1
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    };
+    LEVEL.store(level, Ordering::Relaxed);
+    LAST_QUARTER.store(quarter, Ordering::Relaxed);
+    level
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
@@ -151,24 +193,25 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
     }
 }
 
-/// Effective idle timeout (in milliseconds) for system-RAM caches (staging
-/// buffers, loose shadows, and the mapped pipeline library), scaled down
-/// earlier on 16 GB PCs so free physical RAM stays clear of HDD paging.
+/// Effective idle timeout (in milliseconds) for system-RAM and L0 shared GPU
+/// caches (staging buffers, loose shadows, and the mapped pipeline library),
+/// scaled down under low physical RAM OR high WDDM shared GPU memory usage.
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     const NORMAL_MS: u64 = 8_000;
     const MODERATE_MS: u64 = 3_500;
     const HIGH_MS: u64 = 1_500;
-    let Some(avail) = avail_phys else {
-        return NORMAL_MS;
+    let phys_ms = match avail_phys {
+        Some(avail) if avail < 3 * GIB => HIGH_MS,
+        Some(avail) if avail < 5 * GIB => MODERATE_MS,
+        _ => NORMAL_MS,
     };
-    if avail < 3 * GIB {
-        HIGH_MS
-    } else if avail < 5 * GIB {
-        MODERATE_MS
-    } else {
-        NORMAL_MS
-    }
+    let shared_ms = match shared_memory_pressure() {
+        2 => 1_000,
+        1 => 2_500,
+        _ => NORMAL_MS,
+    };
+    phys_ms.min(shared_ms)
 }
 
 /// How many references are held on a host object (its COM count): ours
@@ -210,6 +253,9 @@ fn sweep() {
         return;
     }
     crate::pipeline::trim_library();
+    trim_scratch_pool(false);
+    crate::texback::let_go_idle(false);
+    crate::list::trim_idle(false);
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
@@ -1630,6 +1676,76 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     }
     // Freed outside the lock.
     drop(freed);
+}
+
+/// Releases idle pooled scratch upload chunks when forced (OOM recovery) or
+/// under WDDM shared-memory / physical-RAM pressure.
+fn trim_scratch_pool(force: bool) {
+    const PRESSURE_RAM: u64 = 3 * (1024 << 20);
+    if !force
+        && shared_memory_pressure() < 2
+        && !available_physical_ram().is_some_and(|free| free < PRESSURE_RAM)
+    {
+        return;
+    }
+    let freed = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.kept.is_empty() {
+            return;
+        }
+        let count = spare.kept.len() as u64;
+        let bytes = spare.bytes;
+        spare.bytes = 0;
+        ALIVE[1].fetch_sub(count, Ordering::Relaxed);
+        ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+        ALIVE[3].fetch_sub(count, Ordering::Relaxed);
+        ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+        std::mem::take(&mut spare.kept)
+    };
+    drop(freed);
+}
+
+/// `E_OUTOFMEMORY` (`0x8007000E`), returned by D3D12 when WDDM shared/local
+/// GPU memory or system commit is exhausted.
+const E_OUTOFMEMORY: windows::core::HRESULT = windows::core::HRESULT(0x8007_000E_u32 as i32);
+
+impl Host {
+    /// Emergency memory reclamation triggered on `E_OUTOFMEMORY` before
+    /// retrying a D3D12 allocation once. Serialized and rate-limited (250 ms)
+    /// so concurrent threads wait for reclamation to finish and then retry.
+    fn reclaim_for_oom(&self, why: &str) {
+        static GUARD: Mutex<u64> = Mutex::new(0);
+        let mut last = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_ms();
+        if now < *last + 250 {
+            return;
+        }
+        *last = now;
+        if let Some([lb, lu, sb, su]) = self.video_memory() {
+            tracing::warn!(
+                why,
+                vram_used_mb = lu >> 20,
+                vram_budget_mb = lb >> 20,
+                shared_used_mb = su >> 20,
+                shared_budget_mb = sb >> 20,
+                avail_ram_mb = available_physical_ram().unwrap_or(0) >> 20,
+                "E_OUTOFMEMORY: draining idle GPU/L0 pools and burying retired objects before retry"
+            );
+        } else {
+            tracing::warn!(why, "E_OUTOFMEMORY: draining idle GPU/L0 pools before retry");
+        }
+        bury(FINISHED.load(Ordering::Acquire));
+        trim_scratch_pool(true);
+        crate::texture::drain_pools();
+        crate::texback::let_go_idle(true);
+        crate::shadow::drain_pools();
+        crate::list::trim_idle(true);
+        crate::pipeline::trim_library();
+        crate::shadow::let_go_idle();
+        crate::texture::let_go_idle();
+        crate::resource::let_go_idle();
+        bury(FINISHED.load(Ordering::Acquire));
+    }
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -3606,64 +3722,84 @@ impl Host {
 
     /// An allocator and a closed list for a prelude.
     fn make_prelude(&self) -> Option<Prelude> {
-        // SAFETY: plain object creation.
-        let made: windows::core::Result<Prelude> = unsafe {
-            (|| {
-                let allocator: ID3D12CommandAllocator =
-                    self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-                let list: ID3D12GraphicsCommandList =
-                    self.device
-                        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
-                list.Close()?;
-                Ok((allocator, list))
-            })()
-        };
         LISTS[1].fetch_add(1, Ordering::Relaxed);
-        match made {
-            Ok(prelude) => Some(prelude),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host list for a prelude");
-                None
+        for attempt in 0..2 {
+            // SAFETY: plain object creation.
+            let made: windows::core::Result<Prelude> = unsafe {
+                (|| {
+                    let allocator: ID3D12CommandAllocator =
+                        self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    let list: ID3D12GraphicsCommandList =
+                        self.device
+                            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                    list.Close()?;
+                    Ok((allocator, list))
+                })()
+            };
+            match made {
+                Ok(prelude) => return Some(prelude),
+                Err(e) if attempt == 0 && e.code() == E_OUTOFMEMORY => {
+                    self.reclaim_for_oom("make_prelude");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "no host list for a prelude");
+                    return None;
+                }
             }
         }
+        None
     }
 
     fn make_list(&self) -> windows::core::Result<HostList> {
-        // SAFETY: plain object creation.
-        unsafe {
-            let allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &allocator,
-                None,
-            )?;
-            let prelude = OnceLock::new();
-            if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude());
+        for attempt in 0..2 {
+            // SAFETY: plain object creation.
+            let made: windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> = unsafe {
+                (|| {
+                    let allocator: ID3D12CommandAllocator = self
+                        .device
+                        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
+                        0,
+                        D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        &allocator,
+                        None,
+                    )?;
+                    Ok((allocator, list))
+                })()
+            };
+            match made {
+                Ok((allocator, list)) => {
+                    let prelude = OnceLock::new();
+                    if !lazy_prelude() {
+                        let _ = prelude.set(self.make_prelude());
+                    }
+                    return Ok(HostList {
+                        allocator,
+                        list,
+                        deferred: Mutex::default(),
+                        scratch: Mutex::default(),
+                        states: Mutex::default(),
+                        states_generation: std::sync::atomic::AtomicU64::new(0),
+                        buffers: Mutex::default(),
+                        twins: Mutex::default(),
+                        prelude,
+                        pipelines: Mutex::default(),
+                        budget: OnceLock::new(),
+                        indirect_args: Mutex::default(),
+                        _alive: Counted::new(),
+                        #[cfg(feature = "diagnostics")]
+                        notes: Mutex::default(),
+                        #[cfg(feature = "diagnostics")]
+                        stamps: OnceLock::new(),
+                    });
+                }
+                Err(e) if attempt == 0 && e.code() == E_OUTOFMEMORY => {
+                    self.reclaim_for_oom("make_list");
+                }
+                Err(e) => return Err(e),
             }
-            Ok(HostList {
-                allocator,
-                list,
-                deferred: Mutex::default(),
-                scratch: Mutex::default(),
-                states: Mutex::default(),
-                states_generation: std::sync::atomic::AtomicU64::new(0),
-                buffers: Mutex::default(),
-                twins: Mutex::default(),
-                prelude,
-                pipelines: Mutex::default(),
-                budget: OnceLock::new(),
-                indirect_args: Mutex::default(),
-                _alive: Counted::new(),
-                #[cfg(feature = "diagnostics")]
-                notes: Mutex::default(),
-                #[cfg(feature = "diagnostics")]
-                stamps: OnceLock::new(),
-            })
         }
+        Err(windows::core::Error::from(E_OUTOFMEMORY))
     }
 
     /// The card's clock ([`CARD_CLOCK_US`]), made at the first send.
@@ -5167,10 +5303,11 @@ impl Host {
         // sweep waits for a submission that finds none in the air: there is
         // one at every present).
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sweep_gap = if shared_memory_pressure() >= 2 { 500 } else { 1500 };
         if !behind {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + sweep_gap {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
@@ -7012,25 +7149,31 @@ impl Host {
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation of a read-back buffer.
-        let made = unsafe {
-            self.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                None,
-                &mut buffer,
-            )
-        };
-        match made {
-            Ok(()) => buffer,
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no read-back buffer");
-                None
+        for attempt in 0..2 {
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a read-back buffer.
+            let made = unsafe {
+                self.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut buffer,
+                )
+            };
+            match made {
+                Ok(()) => return buffer,
+                Err(e) if attempt == 0 && e.code() == E_OUTOFMEMORY => {
+                    self.reclaim_for_oom("read_back_buffer");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, size, "no read-back buffer");
+                    return None;
+                }
             }
         }
+        None
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -7053,31 +7196,37 @@ impl Host {
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of an upload buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no upload buffer");
-                None
+        for attempt in 0..2 {
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation and mapping of an upload buffer.
+            let made = unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_GENERIC_READ,
+                        None,
+                        &mut buffer,
+                    )
+                    .and_then(|()| {
+                        let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                        b.Map(0, None, Some(&mut data))
+                    })
+            };
+            match made {
+                Ok(()) => return Some((buffer?, data.cast())),
+                Err(e) if attempt == 0 && e.code() == E_OUTOFMEMORY => {
+                    self.reclaim_for_oom("upload_buffer");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, size, "no upload buffer");
+                    return None;
+                }
             }
         }
+        None
     }
 }
 
@@ -8160,31 +8309,37 @@ impl Host {
             Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of a CPU-visible buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
-                None
+        for attempt in 0..2 {
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation and mapping of a CPU-visible buffer.
+            let made = unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut buffer,
+                    )
+                    .and_then(|()| {
+                        let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                        b.Map(0, None, Some(&mut data))
+                    })
+            };
+            match made {
+                Ok(()) => return Some((buffer?, data.cast())),
+                Err(e) if attempt == 0 && e.code() == E_OUTOFMEMORY => {
+                    self.reclaim_for_oom("shared_buffer");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, size, "no shared buffer");
+                    return None;
+                }
             }
         }
+        None
     }
 
     /// A device-local buffer shaders may write (unordered access) and indirect
@@ -8210,25 +8365,31 @@ impl Host {
             Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation of a device-local buffer.
-        let made = unsafe {
-            self.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COMMON,
-                None,
-                &mut buffer,
-            )
-        };
-        match made {
-            Ok(()) => buffer,
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no unordered-access buffer");
-                None
+        for attempt in 0..2 {
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a device-local buffer.
+            let made = unsafe {
+                self.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+            };
+            match made {
+                Ok(()) => return buffer,
+                Err(e) if attempt == 0 && e.code() == E_OUTOFMEMORY => {
+                    self.reclaim_for_oom("uav_buffer");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, size, "no unordered-access buffer");
+                    return None;
+                }
             }
         }
+        None
     }
 }
 

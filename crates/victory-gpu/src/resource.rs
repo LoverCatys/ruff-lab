@@ -2146,10 +2146,11 @@ pub(crate) fn let_go_idle() {
     static PRESSURE_IDLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let pressure_idle = *PRESSURE_IDLE
         .get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PRESSURE_IDLE").is_none_or(|v| v != "0"));
-    let ram_pressured = pressure_idle
-        && crate::host::available_physical_ram().is_some_and(|free| free < 3 * (1024 << 20));
+    let ram_pressured = (pressure_idle
+        && crate::host::available_physical_ram().is_some_and(|free| free < 3 * (1024 << 20)))
+        || crate::host::shared_memory_pressure() >= 2;
     if ram_pressured {
-        idle_ms = idle_ms.min(5_000);
+        idle_ms = idle_ms.min(if crate::host::shared_memory_pressure() >= 2 { 1_500 } else { 5_000 });
     }
     // `VICTORY_TEXTURE_LRU=1` (from PastiiJay/klbf-lab `0ea9755`, after
     // AKA0GHOST/victory-fork e3aa169 & 7daa701): evict oldest idle copies

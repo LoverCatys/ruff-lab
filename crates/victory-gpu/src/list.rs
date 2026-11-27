@@ -279,6 +279,31 @@ fn fresh_list() -> Option<crate::host::HostList> {
     }
 }
 
+/// Releases idle recycled host lists (each holds command allocators in L0
+/// shared GPU memory) under memory pressure or during OOM recovery.
+#[cfg(windows)]
+pub(crate) fn trim_idle(force: bool) {
+    let keep = if force {
+        0
+    } else if crate::host::shared_memory_pressure() >= 2 {
+        16
+    } else {
+        return;
+    };
+    let gone = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.0.len() <= keep {
+            return;
+        }
+        let mut drained = idle.0.split_off(keep);
+        for Idle(_, bytes) in &drained {
+            idle.1 = idle.1.saturating_sub(*bytes);
+        }
+        std::mem::take(&mut drained)
+    };
+    drop(gone);
+}
+
 /// The host sides of lists whose submission has run (submissions are
 /// waited for; `ran` names the ones it ran, by their place in `lists`):
 /// what they held is let go, as before, and the host lists are reset and

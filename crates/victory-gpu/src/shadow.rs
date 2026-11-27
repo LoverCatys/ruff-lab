@@ -1224,7 +1224,8 @@ fn let_go_idle_snapshots() {
     let avail = crate::host::available_physical_ram();
     let idle_ms = crate::host::ram_idle_ms(avail);
     let idle = crate::host::long_ago(POOL_USED.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES);
-    let pressured = avail.is_some_and(|free| free < PRESSURE_RAM);
+    let pressured = avail.is_some_and(|free| free < PRESSURE_RAM)
+        || crate::host::shared_memory_pressure() >= 2;
     let Some(most) = snapshots_to_keep(idle, pressured) else {
         return;
     };
@@ -1233,6 +1234,22 @@ fn let_go_idle_snapshots() {
         trim_pool(&mut pool, most)
     };
     drop(gone);
+}
+
+/// Immediately empties the snapshot and exact-copy reuse pools (called during
+/// OOM recovery).
+pub(crate) fn drain_pools() {
+    let gone_snaps = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *pool)
+    };
+    let gone_exact = {
+        let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        pool.1 = 0;
+        std::mem::take(&mut pool.0)
+    };
+    drop(gone_snaps);
+    drop(gone_exact);
 }
 
 fn snapshots_to_keep(idle: bool, pressured: bool) -> Option<usize> {
@@ -3749,7 +3766,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
+            .range((at.saturating_sub(root_window_most()), 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
@@ -3805,12 +3822,34 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// against 120 MB, 7,087 write-watch askings against 2,600, and 5,263
 /// windows (4.5 GB) let go in two minutes against 393 in a whole run.
 pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    // With whole windows (the default) there is one window to a cell and
-    // nothing to choose: exactly `find`.
-    if !fine() {
+    // With whole 4 MiB windows and no extended root windows there is one window
+    // per cell and nothing to choose: exactly `find`.
+    if !fine() && root_window_most() <= WINDOW {
         return find(address, len);
     }
     lookup(address, len, true)
+}
+
+/// Like [`find`] for a root constant buffer (architecturally capped at 64 KiB):
+/// matches any title buffer containing `address`, and when falling back to a
+/// loose window uses a bounded 64 KiB ask instead of allocating a 16-32 MiB
+/// unsized root window.
+pub(crate) fn find_cbv(address: u64) -> Option<Arc<Shadow>> {
+    let cbv_end = address.checked_add(1 << 16)?;
+    let end = address.checked_add(1)?;
+    let map = buffers();
+    let key = map
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end)
+        .map(|(k, _)| *k);
+    if key.is_none() {
+        drop(map);
+        return loose(address, cbv_end, false, true);
+    }
+    drop(map);
+    lookup(address, 1, false)
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
@@ -4042,16 +4081,41 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 }
 
 /// The most an ask without a length (a root view) is given past its 4 MiB
-/// cell, in bytes: `VICTORY_ROOT_WINDOW_MB` (32; 4 = the cell alone, as
-/// before), in whole cells (`kitty-core/Kitty6` `5d622a1`).
+/// cell, in bytes: `VICTORY_ROOT_WINDOW_MB` (default `16` on `<= 20 GiB` RAM
+/// PCs to stay clear of the ~7.5 GiB WDDM L0 shared-memory ceiling, `32` on
+/// larger PCs; `4` = the cell alone), in whole cells (`kitty-core/Kitty6` `5d622a1`).
 fn root_window_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
+        let default_mb = match crate::host::total_physical_ram() {
+            Some(ram) if ram <= 20 * (1024 << 20) => 16,
+            _ => 32,
+        };
         let mb = std::env::var("VICTORY_ROOT_WINDOW_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok());
-        (mb.unwrap_or(32).clamp(4, 256) << 20) / WINDOW * WINDOW
+        (mb.unwrap_or(default_mb).clamp(4, 256) << 20) / WINDOW * WINDOW
     })
+}
+
+/// Reuses an existing `LOOSE` window for an unsized root view at `address`
+/// when one already covers `[address, min_end)`, preventing quadratic 4 MiB-step
+/// overlap across contiguous committed heaps while keeping at least `most / 2`
+/// (or full `wanted_end` when committed memory ends sooner) of reach.
+fn reuse_root(
+    windows: impl Iterator<Item = (u64, u64)>,
+    address: u64,
+    cell: u64,
+    wanted_end: u64,
+    most: u64,
+) -> Option<(u64, u64)> {
+    let half = (most / 2).max(WINDOW);
+    let min_end = wanted_end
+        .min(address.saturating_add(half))
+        .max(cell.saturating_add(WINDOW));
+    windows
+        .filter(|&(start, bytes)| start <= address && start.saturating_add(bytes) >= min_end)
+        .max_by_key(|&(start, bytes)| (start.saturating_add(bytes), std::cmp::Reverse(start)))
 }
 
 /// How long a [`committed_reach`] answer is reused, in milliseconds
@@ -4159,13 +4223,18 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     };
     // Fast path under shared read lock (`kitty-core/Kitty6` `42046f5`): all
     // recording threads look up existing windows concurrently.
+    let root_most = root_window_most();
+    let reach_base = cell.saturating_sub(root_most);
     {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         let key = if unsized_ask && tails() {
             let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
             longest_tail(there, address, end)
-        } else if any && fine() && !unsized_ask {
-            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+        } else if unsized_ask && root_most > WINDOW {
+            let there = map.range((reach_base, 0)..=(cell, u64::MAX)).map(|(key, _)| *key);
+            Some(reuse_root(there, address, cell, named.0 + named.1, root_most).unwrap_or(named))
+        } else if any && (fine() || root_most > WINDOW) && !unsized_ask {
+            let there = map.range((reach_base, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
             Some(holder(there, address, end).unwrap_or(named))
         } else {
             Some(named)
@@ -4179,11 +4248,13 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if any && fine() && !unsized_ask {
-        // The windows that begin in the ask's cell at or below the ask (one
-        // that begins in a cell below and reaches this far is passed over:
-        // the ask then makes its own).
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+    } else if unsized_ask && root_most > WINDOW {
+        let there = map.range((reach_base, 0)..=(cell, u64::MAX)).map(|(key, _)| *key);
+        reuse_root(there, address, cell, named.0 + named.1, root_most).unwrap_or(named)
+    } else if any && (fine() || root_most > WINDOW) && !unsized_ask {
+        // The windows starting at or below the ask (including extended root
+        // windows) that already cover `[address, end)`.
+        let there = map.range((reach_base, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         holder(there, address, end).unwrap_or(named)
     } else {
         named
@@ -4262,10 +4333,13 @@ fn exact_reuse() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_REUSE").is_none_or(|v| v != "0"))
 }
 
-/// Releases pooled exact-copy buffers when physical RAM is tight (< 3 GiB).
+/// Releases pooled exact-copy buffers when physical RAM is tight (< 3 GiB)
+/// or WDDM shared GPU memory is under high pressure.
 fn let_go_idle_exact_pool() {
     const PRESSURE_RAM: u64 = 3 * (1024 << 20);
-    if crate::host::available_physical_ram().is_some_and(|free| free < PRESSURE_RAM) {
+    if crate::host::shared_memory_pressure() >= 2
+        || crate::host::available_physical_ram().is_some_and(|free| free < PRESSURE_RAM)
+    {
         let gone = {
             let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
             pool.1 = 0;
@@ -4508,6 +4582,35 @@ mod window_tests {
         assert_eq!(root_extent(cell, WINDOW, cell + (12 << 20) + 1, most), (cell, 16 << 20));
         assert_eq!(root_extent(cell, WINDOW, cell + (1 << 30), most), (cell, most));
         assert_eq!(root_extent(cell, 2 * WINDOW, cell + WINDOW, most), (cell, 2 * WINDOW));
+    }
+
+    /// Existing root windows are reused across adjacent 4 MiB cells so a
+    /// contiguous committed heap does not create 8x overlapping windows.
+    #[test]
+    fn root_windows_reuse_existing_coverage() {
+        use super::reuse_root;
+        let most = 16 << 20;
+        let base = 0x6000_00000u64;
+        let existing = [(base, most)];
+        // +4 MiB and +8 MiB still have 12 MiB and 8 MiB of reach in `existing`.
+        assert_eq!(
+            reuse_root(existing.into_iter(), base + (4 << 20) + 0x100, base + (4 << 20), base + (20 << 20), most),
+            Some((base, most))
+        );
+        assert_eq!(
+            reuse_root(existing.into_iter(), base + (8 << 20), base + (8 << 20), base + (24 << 20), most),
+            Some((base, most))
+        );
+        // +12 MiB only has 4 MiB left while committed memory runs past +16 MiB: allocate a new window.
+        assert_eq!(
+            reuse_root(existing.into_iter(), base + (12 << 20), base + (12 << 20), base + (28 << 20), most),
+            None
+        );
+        // If committed memory ends at +16 MiB, +12 MiB still reuses `existing` (no extra buffer).
+        assert_eq!(
+            reuse_root(existing.into_iter(), base + (12 << 20) + 0x40, base + (12 << 20), base + most, most),
+            Some((base, most))
+        );
     }
 
     /// The reach of committed memory stops where the commitment does.

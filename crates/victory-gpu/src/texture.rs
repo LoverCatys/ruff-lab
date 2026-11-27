@@ -36,6 +36,8 @@ macro_rules! once {
 struct StagingMem {
     buffer: ID3D12Resource,
     data: usize,
+    /// Bucket size for [`SPARE_UPLOAD`] (`0` = not pooled).
+    upload_pooled: u64,
     /// Device-local linear buffer populated by `gpudetile` when GPU detiling is
     /// active (`(resource, pooled_size)`; `0` = not pooled).
     linear: Option<(ID3D12Resource, u64)>,
@@ -43,6 +45,16 @@ struct StagingMem {
 
 impl Drop for StagingMem {
     fn drop(&mut self) {
+        if self.upload_pooled != 0 && crate::host::shared_memory_pressure() < 2 {
+            let mut all = SPARE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
+            if all.1 + self.upload_pooled <= UPLOAD_POOL_MAX {
+                all.1 += self.upload_pooled;
+                all.0
+                    .entry(self.upload_pooled)
+                    .or_default()
+                    .push(SpareUpload(self.buffer.clone(), self.data));
+            }
+        }
         if let Some((linear, pooled)) = self.linear.take()
             && pooled != 0
         {
@@ -63,6 +75,37 @@ struct GpuPlan {
     recorded: std::sync::atomic::AtomicU64,
 }
 
+/// Bounded pool of idle upload staging buffers in L0 shared GPU memory
+/// (capped at 32 MiB; drained under shared-memory/RAM pressure and OOM).
+const UPLOAD_POOL_MAX: u64 = 32 << 20;
+const UPLOAD_POOL_SINGLE_MAX: u64 = 4 << 20;
+
+static SPARE_UPLOAD: Mutex<(std::collections::BTreeMap<u64, Vec<SpareUpload>>, u64)> =
+    Mutex::new((std::collections::BTreeMap::new(), 0));
+
+struct SpareUpload(ID3D12Resource, usize);
+// SAFETY: a mapped D3D12 upload buffer touched by nobody while idle in the pool.
+unsafe impl Send for SpareUpload {}
+
+fn upload_staging_buffer(host: &crate::host::Host, bytes: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    let size = bytes.max(64 << 10).next_power_of_two();
+    if size > UPLOAD_POOL_SINGLE_MAX {
+        return host.upload_buffer(bytes).map(|(b, d)| (b, d, 0));
+    }
+    let spare = {
+        let mut all = SPARE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = all.0.get_mut(&size).and_then(Vec::pop);
+        if taken.is_some() {
+            all.1 -= size;
+        }
+        taken
+    };
+    match spare {
+        Some(SpareUpload(buffer, data)) => Some((buffer, data as *mut u8, size)),
+        None => host.upload_buffer(size).map(|(b, d)| (b, d, size)),
+    }
+}
+
 /// Bounded pool of idle device-local linear detile buffers (capped at 64 MiB
 /// for 8 GB VRAM GPUs; individual buffers > 16 MiB are released directly).
 const LINEAR_POOL_MAX: u64 = 64 << 20;
@@ -74,6 +117,22 @@ static SPARE_LINEAR: Mutex<(std::collections::BTreeMap<u64, Vec<SpareLinear>>, u
 struct SpareLinear(ID3D12Resource);
 // SAFETY: a device-local D3D12 resource is free-threaded.
 unsafe impl Send for SpareLinear {}
+
+/// Immediately drains both idle staging pools (called during OOM recovery).
+pub(crate) fn drain_pools() {
+    let gone_upload = {
+        let mut all = SPARE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
+        all.1 = 0;
+        std::mem::take(&mut all.0)
+    };
+    let gone_linear = {
+        let mut all = SPARE_LINEAR.lock().unwrap_or_else(|e| e.into_inner());
+        all.1 = 0;
+        std::mem::take(&mut all.0)
+    };
+    drop(gone_upload);
+    drop(gone_linear);
+}
 
 fn linear_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, u64)> {
     let size = total.max(64 << 10).next_power_of_two();
@@ -564,6 +623,28 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    const PRESSURE_RAM: u64 = 3 * (1024 << 20);
+    let shared_pressure = crate::host::shared_memory_pressure();
+    let avail_ram = crate::host::available_physical_ram();
+    if shared_pressure >= 1 || avail_ram.is_some_and(|free| free < PRESSURE_RAM) {
+        let gone_upload = {
+            let mut all = SPARE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
+            all.1 = 0;
+            std::mem::take(&mut all.0)
+        };
+        drop(gone_upload);
+    }
+    let vram_high = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .is_some_and(|[budget, used, ..]| budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 85);
+    if vram_high || shared_pressure >= 2 {
+        let gone_linear = {
+            let mut all = SPARE_LINEAR.lock().unwrap_or_else(|e| e.into_inner());
+            all.1 = 0;
+            std::mem::take(&mut all.0)
+        };
+        drop(gone_linear);
+    }
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
@@ -571,7 +652,7 @@ pub(crate) fn let_go_idle() {
     if map.is_empty() {
         return;
     }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let idle_ms = crate::host::ram_idle_ms(avail_ram);
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
@@ -1020,7 +1101,7 @@ impl Staging {
         if mem.is_none() {
             let host = host()?;
             let upload_bytes = self.gpu.as_ref().map_or(self.bytes, |g| g.raw.bytes);
-            let (buffer, data) = host.upload_buffer(upload_bytes)?;
+            let (buffer, data, upload_pooled) = upload_staging_buffer(host, upload_bytes)?;
             let linear = if let Some(gpu) = &self.gpu {
                 let linear = linear_buffer(host, gpu.total)?;
                 // SAFETY: freshly allocated upload buffer of `gpu.raw.bytes`.
@@ -1036,6 +1117,7 @@ impl Staging {
             *mem = Some(StagingMem {
                 buffer,
                 data: data as usize,
+                upload_pooled,
                 linear,
             });
         }
@@ -1421,19 +1503,20 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     let hash = hasher.finalize();
     let mut first = [0u8; 8];
     first.copy_from_slice(&hash.as_bytes()[..8]);
-    u64::from_le_bytes(first) | 1
+    // Bit 0 = 1 (never 0); bit 1 = 0 tags 3-window blake3 vs full-body xxh3.
+    (u64::from_le_bytes(first) & !3) | 1
 }
 
 /// Maximum size for full-texture fingerprinting of aliased textures (faces,
 /// hair painted through another view; `VICTORY_FULL_PRINT_KB` or
-/// `K6_FULL_PRINT_KB`, default `4096` KiB, `0` disables; `kitty-core/Kitty6` `ae3cce8`).
+/// `K6_FULL_PRINT_KB`, default `1024` KiB, `0` disables; `kitty-core/Kitty6` `ae3cce8`).
 fn full_print_bytes() -> usize {
     static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *BYTES.get_or_init(|| {
         ["VICTORY_FULL_PRINT_KB", "K6_FULL_PRINT_KB"]
             .iter()
             .find_map(|k| std::env::var(k).ok().and_then(|v| v.trim().parse::<usize>().ok()))
-            .unwrap_or(4096)
+            .unwrap_or(1024)
             << 10
     })
 }
@@ -1444,15 +1527,18 @@ pub(crate) fn aliased(at: u64, len: u64) -> bool {
     crate::inplace::has_alias(at as usize, at.saturating_add(len) as usize)
 }
 
-/// Full-body fingerprint for aliased textures up to [`full_print_bytes`] using
-/// fast `xxh3-128` 64 KiB chunks; falls back to [`fingerprint`] otherwise.
-pub(crate) fn fingerprint_texture(at: u64, len: u64) -> u64 {
+/// Whether an aliased texture should stay on periodic recheck beyond
+/// `RECHECK_FRAMES`: bounded to dynamic-sized textures (`<= VICTORY_FULL_PRINT_KB`,
+/// at least 48 KiB) so multi-megabyte world textures don't churn forever.
+pub(crate) fn aliased_recheckable(at: u64, len: u64) -> bool {
+    let cap = full_print_bytes().max(48 << 10);
+    (len as usize) <= cap && aliased(at, len)
+}
+
+/// Full-body xxh3-128 fingerprint (bit 0 = 1, bit 1 = 1).
+fn fingerprint_full(at: u64, len: u64) -> u64 {
     const WINDOW: usize = 64 << 10;
-    let most = full_print_bytes();
     let n = len as usize;
-    if n <= 48 << 10 || n > most || !aliased(at, len) {
-        return fingerprint(at, len);
-    }
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
@@ -1470,7 +1556,30 @@ pub(crate) fn fingerprint_texture(at: u64, len: u64) -> u64 {
         }
     });
     let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
-    u64::from_le_bytes(first) | 1
+    (u64::from_le_bytes(first) & !3) | 3
+}
+
+/// Full-body fingerprint for aliased textures up to [`full_print_bytes`] using
+/// fast `xxh3-128` 64 KiB chunks; falls back to [`fingerprint`] otherwise.
+pub(crate) fn fingerprint_texture(at: u64, len: u64) -> u64 {
+    let most = full_print_bytes();
+    let n = len as usize;
+    if n <= 48 << 10 || n > most || !aliased(at, len) {
+        return fingerprint(at, len);
+    }
+    fingerprint_full(at, len)
+}
+
+/// Compares `[at, at + len)` against a previously stored `prev` fingerprint
+/// using the exact same algorithm (tagged in bit 1 of `prev`), preventing
+/// false re-uploads when a texture's alias status changes between checks.
+pub(crate) fn recheck_fingerprint(at: u64, len: u64, prev: u64) -> Option<u64> {
+    let now = if prev & 2 != 0 {
+        fingerprint_full(at, len)
+    } else {
+        fingerprint(at, len)
+    };
+    (now == prev).then_some(now)
 }
 
 /// Whether a title texture has a staging buffer: a list recorded its
@@ -1735,7 +1844,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         (None, None)
     };
     let upload_bytes = gpu_plan.as_ref().map_or(total, |g| g.raw.bytes);
-    let (buffer, data) = host.upload_buffer(upload_bytes)?;
+    let (buffer, data, upload_pooled) = upload_staging_buffer(host, upload_bytes)?;
     if let Some(gpu) = &gpu_plan {
         // SAFETY: freshly created upload buffer of `gpu.raw.bytes`.
         unsafe { crate::gpudetile::write_tables(&layout, &gpu.raw, data) };
@@ -1753,6 +1862,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         mem: Mutex::new(Some(StagingMem {
             buffer,
             data: data as usize,
+            upload_pooled,
             linear,
         })),
         needs_fill: std::sync::atomic::AtomicBool::new(true),
@@ -1889,5 +1999,28 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+
+    /// `recheck_fingerprint` compares with the exact algorithm (3-window blake3
+    /// vs full-body xxh3) that produced the original print, so an alias toggle
+    /// on unchanged bytes never triggers a false positive re-upload.
+    #[test]
+    fn recheck_fingerprint_uses_original_algorithm_tag() {
+        let mut buf = vec![0x3Cu8; 128 << 10];
+        let at = buf.as_ptr() as u64;
+        let len = buf.len() as u64;
+        let win = super::fingerprint(at, len);
+        let full = super::fingerprint_full(at, len);
+        assert_eq!(win & 3, 1);
+        assert_eq!(full & 3, 3);
+        assert_ne!(win, full);
+        assert_eq!(super::recheck_fingerprint(at, len, win), Some(win));
+        assert_eq!(super::recheck_fingerprint(at, len, full), Some(full));
+        // Mutating a byte outside the 3 windows is caught by `full`.
+        buf[20 << 10] ^= 0xFF;
+        assert_eq!(super::recheck_fingerprint(at, len, full), None);
+        // Mutating a byte inside the first window is caught by `win`.
+        buf[16] ^= 0xFF;
+        assert_eq!(super::recheck_fingerprint(at, len, win), None);
     }
 }

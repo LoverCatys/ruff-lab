@@ -92,6 +92,27 @@ fn spare_most() -> u64 {
     })
 }
 
+/// Releases pooled read-back buffers when forced (OOM reclaim) or under
+/// shared GPU memory / physical RAM pressure.
+pub(crate) fn let_go_idle(force: bool) {
+    const PRESSURE_RAM: u64 = 3 * (1024 << 20);
+    if !force
+        && crate::host::shared_memory_pressure() < 2
+        && !crate::host::available_physical_ram().is_some_and(|free| free < PRESSURE_RAM)
+    {
+        return;
+    }
+    let gone = {
+        let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        if all.1 == 0 {
+            return;
+        }
+        all.1 = 0;
+        std::mem::take(&mut all.0)
+    };
+    drop(gone);
+}
+
 /// The power-of-two size a buffer of `total` bytes is pooled at; 0: not pooled.
 fn pool_size(total: u64, on: bool) -> u64 {
     let size = total.max(64 << 10).next_power_of_two();

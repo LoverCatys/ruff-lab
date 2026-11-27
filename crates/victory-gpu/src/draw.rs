@@ -532,7 +532,7 @@ fn aliased_every() -> u64 {
         ["VICTORY_ALIASED_RECHECK_EVERY", "K6_ALIASED_RECHECK_EVERY"]
             .iter()
             .find_map(|k| std::env::var(k).ok().and_then(|v| v.trim().parse().ok()))
-            .unwrap_or(30)
+            .unwrap_or(120)
     })
 }
 
@@ -641,7 +641,11 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
     });
-    let shadow = crate::shadow::find(address, 1)?;
+    let shadow = if srv {
+        crate::shadow::find(address, 1)?
+    } else {
+        crate::shadow::find_cbv(address)?
+    };
     let len = shadow
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
@@ -2252,11 +2256,20 @@ impl State {
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
         let mut room = crate::resource::room();
-        // On 8 GB GPUs, try reclaiming idle textures immediately before
-        // refusing new ones for 4 seconds.
+        // On 8 GB GPUs, try reclaiming idle textures before refusing new ones,
+        // rate-limited to once per second so we don't sort 15k+ textures every frame.
         if !room {
-            crate::resource::let_go_idle();
-            room = crate::resource::room();
+            static LAST_EVICT: AtomicU64 = AtomicU64::new(0);
+            let now = crate::host::now_ms();
+            let last = LAST_EVICT.load(Ordering::Relaxed);
+            if now >= last + 1_000
+                && LAST_EVICT
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                crate::resource::let_go_idle();
+                room = crate::resource::room();
+            }
         }
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
@@ -2268,6 +2281,7 @@ impl State {
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
+        let pass_began = std::time::Instant::now();
         // Room again: the slots held back while the card was full are due
         // now (`full_card_pass`).
         if room {
@@ -2340,11 +2354,14 @@ impl State {
             }
             None => (span, per_frame),
         };
-        let began = std::time::Instant::now();
+        let mut processed = 0usize;
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            if SPENT.load(Ordering::Relaxed) >= bytes_at_most
+                || (processed > 0 && pass_began.elapsed() > span)
+            {
                 break;
             }
+            processed += 1;
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -2365,27 +2382,27 @@ impl State {
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint_texture(at, len) == print {
+                if let Some(same_print) = crate::texture::recheck_fingerprint(at, len, print) {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                            host.texture_slot_recheck(index, write, frame + wait, (at, len), same_print, looks + 1, uploaded)
                         }
                         None => match recheck_every() {
-                            0 if aliased_every() > 0 && crate::texture::aliased(at, len) => {
+                            0 if aliased_every() > 0 && crate::texture::aliased_recheckable(at, len) => {
                                 host.texture_slot_recheck(
                                     index,
                                     write,
                                     frame + aliased_every(),
                                     (at, len),
-                                    print,
+                                    same_print,
                                     looks,
                                     uploaded,
                                 )
                             }
                             0 => host.texture_slot_done(index, write, None),
                             every => {
-                                host.texture_slot_recheck(index, write, frame + every, (at, len), print, looks, uploaded)
+                                host.texture_slot_recheck(index, write, frame + every, (at, len), same_print, looks, uploaded)
                             }
                         },
                     }
