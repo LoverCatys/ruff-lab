@@ -51,6 +51,7 @@ use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
+use crate::host::sets::{CopySet, Member};
 use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
@@ -68,6 +69,8 @@ struct Memory {
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
+    /// Cached `CopySet` for `copies`, rebuilt only when `copies.len()` grows.
+    set: Option<Arc<CopySet>>,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -108,6 +111,7 @@ impl Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
             copies: Vec::new(),
+            set: None,
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -231,6 +235,30 @@ impl Memory {
         self.map(address);
         self.map((address & !(CELL - 1)) + CELL);
     }
+
+    /// Cached immutable `CopySet` of all currently numbered copies.
+    fn copy_set(&mut self) -> Arc<CopySet> {
+        if let Some(set) = &self.set
+            && set.copies() == self.copies.len()
+        {
+            return set.clone();
+        }
+        let members = self
+            .copies
+            .iter()
+            .map(|shadow| {
+                let (start, len) = shadow.span();
+                Member {
+                    shadow: shadow.clone(),
+                    at: start as usize,
+                    len: len as usize,
+                }
+            })
+            .collect();
+        let set = Arc::new(CopySet::new(self.copies.len(), members));
+        self.set = Some(set.clone());
+        set
+    }
 }
 
 /// Before a draw whose shader reads title memory by address: what its
@@ -298,9 +326,14 @@ pub(crate) fn ready(
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
+    let grouped_read = first_read && crate::host::sets::on();
+    if grouped_read && !m.copies.is_empty() {
+        let set = m.copy_set();
+        list.defer_refresh_set(&set);
+    }
     for (n, shadow) in m.copies.iter().enumerate() {
         let (start, len) = shadow.span();
-        if first_read || n >= numbered {
+        if !grouped_read && (first_read || n >= numbered) {
             shadow.refresh(list, start, len);
         }
         if writes && (first_write || n >= numbered) {
