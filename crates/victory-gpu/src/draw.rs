@@ -1762,41 +1762,40 @@ impl State {
                 }
             }
             // `HostHeap::mirror` uses striped slot locks and `buffer_copy` is
-            // read-only, so large batches (up to 35k slots/frame) mirror in
-            // parallel across worker threads.
-            let threads = std::thread::available_parallelism()
-                .map_or(4, |n| (n.get() / 2).clamp(2, 6))
+            // read-only, so large batches mirror across the warm `wide` worker
+            // pool without spawning fresh OS threads every frame.
+            let threads = (crate::shadow::wide_worker_count() + 1)
                 .min((work.len() / 64).max(1))
                 .max(1);
             let chunk_len = work.len().div_ceil(threads).max(1);
             type SlotEntry = (u32, Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>);
-            let chunks: Vec<Vec<SlotEntry>> = std::thread::scope(|s| {
-                let handles: Vec<_> = work
-                    .chunks(chunk_len)
-                    .map(|chunk| {
-                        s.spawn(move || {
-                            let mut out = Vec::with_capacity(chunk.len());
-                            for &(index, handle) in chunk {
-                                let entry = host
-                                    .mirror(index, handle, true)
-                                    .and_then(|view| {
-                                        let (shadow, address, len) =
-                                            crate::descriptor::host::buffer_copy(&view)?;
-                                        #[cfg(feature = "diagnostics")]
-                                        if host.shows(index, &shadow.buffer) == Some(false) {
-                                            HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                        Some((shadow, address, address + len))
-                                    });
-                                out.push((index, entry));
-                            }
-                            out
-                        })
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
-            });
-            for chunk in chunks {
+            let chunks = std::sync::Mutex::new(Vec::<Vec<SlotEntry>>::with_capacity(threads));
+            let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = work
+                .chunks(chunk_len)
+                .map(|chunk| {
+                    let chunks = &chunks;
+                    Box::new(move || {
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for &(index, handle) in chunk {
+                            let entry = host
+                                .mirror(index, handle, true)
+                                .and_then(|view| {
+                                    let (shadow, address, len) =
+                                        crate::descriptor::host::buffer_copy(&view)?;
+                                    #[cfg(feature = "diagnostics")]
+                                    if host.shows(index, &shadow.buffer) == Some(false) {
+                                        HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Some((shadow, address, address + len))
+                                });
+                            out.push((index, entry));
+                        }
+                        chunks.lock().unwrap_or_else(|e| e.into_inner()).push(out);
+                    }) as Box<dyn FnOnce() + Send + '_>
+                })
+                .collect();
+            crate::shadow::wide_scope(jobs);
+            for chunk in chunks.into_inner().unwrap_or_else(|e| e.into_inner()) {
                 for (index, entry) in chunk {
                     match entry {
                         Some(val) => {

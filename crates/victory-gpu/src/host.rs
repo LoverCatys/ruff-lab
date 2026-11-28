@@ -6909,14 +6909,21 @@ impl Batch {
         Self::update(&shadow, from, to);
     }
 
+    /// Brings `[from, to)` of a copy up to date and returns copied bytes.
+    fn update_bytes(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let copied = shadow.update(from, to - from);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::range(from, to - from, started.elapsed().as_micros() as u64, 0);
+        copied
+    }
+
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
         let started = std::time::Instant::now();
-        let copied = shadow.update(from, to - from);
-        let us = started.elapsed().as_micros() as u64;
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::range(from, to - from, us, 0);
-        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        let copied = Self::update_bytes(shadow, from, to);
+        PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
 
@@ -6950,19 +6957,31 @@ impl Batch {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
-            // Each copy on its own, several at a time: a copy's refresh
-            // writes that copy and reads title memory, nothing of another's.
-            // The time counted is the time it took, not the threads' sum.
+            // Chunk refreshes across the warm worker pool instead of spawning
+            // one heap-allocated job per shadow (up to 4,100 shadows/flush).
             let started = std::time::Instant::now();
-            let before = PREPARING[0].load(Ordering::Relaxed);
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                .refreshes
-                .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
-                .collect();
+            let mut items = std::mem::take(&mut self.refreshes);
+            let total_copied = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let buckets = ((crate::shadow::wide_worker_count() + 1) * 2).clamp(2, items.len());
+            let chunk_len = items.len().div_ceil(buckets).max(1);
+            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(buckets);
+            while !items.is_empty() {
+                let take = chunk_len.min(items.len());
+                let chunk: Vec<_> = items.drain(..take).collect();
+                let total_copied = total_copied.clone();
+                jobs.push(Box::new(move || {
+                    let mut copied = 0usize;
+                    for (shadow, from, to) in chunk {
+                        copied += Self::update_bytes(&shadow, from, to);
+                    }
+                    if copied > 0 {
+                        total_copied.fetch_add(copied, Ordering::Relaxed);
+                    }
+                }));
+            }
             crate::shadow::wide_run(jobs);
-            let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-            PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            PREPARING[1].fetch_add(total_copied.load(Ordering::Relaxed) as u64, Ordering::Relaxed);
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);

@@ -2432,9 +2432,10 @@ impl HostHeap {
     /// `record`: the record's bytes as the caller read them (through the
     /// kernel, which fails on a page the title unmapped meanwhile where a
     /// read in place would fault: the title unmaps heap pages too).
-    pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
+    /// Result of inspecting a descriptor slot copied into the heap as bytes.
+    pub(crate) fn mirror_copied_at(&self, index: u32, handle: u64, record: &[u8], frame: u64) -> CopyMirror {
         if index >= self.count {
-            return false;
+            return CopyMirror::Unchanged;
         }
         // A slot draws read through a table lately is left to its draws,
         // as the passes over slots picked by index leave it
@@ -2446,9 +2447,8 @@ impl HostHeap {
         // made and brought up to date once more by the pass over buffer
         // views (some 50 ms a frame). `VICTORY_HEAP_SYNC_TABLES=1`: they
         // are mirrored too, as in run 200.
-        if !sync_tables() && self.tabled_lately(index, crate::frame::current()) {
-            COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return false;
+        if !sync_tables() && self.tabled_lately(index, frame) {
+            return CopyMirror::Tabled;
         }
         let n = record.len();
         // Never 0, which is "never looked at". (A multiply-and-fold over
@@ -2458,18 +2458,18 @@ impl HostHeap {
         let print = record_print(record) | 1;
         let copied = match self.copied.get() {
             Some(copied) => copied,
-            None if record[..n].iter().all(|&b| b == 0) => return false,
+            None if record[..n].iter().all(|&b| b == 0) => return CopyMirror::Unchanged,
             None => self
                 .copied
                 .get_or_init(|| (0..self.count).map(|_| AtomicU64::new(0)).collect()),
         };
         let Some(slot) = copied.get(index as usize) else {
-            return false;
+            return CopyMirror::Unchanged;
         };
         let mut prev = slot.load(Ordering::Acquire);
         loop {
             if prev == print || (prev == 0 && record[..n].iter().all(|&b| b == 0)) {
-                return false;
+                return CopyMirror::Unchanged;
             }
             match slot.compare_exchange_weak(prev, print, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => break,
@@ -2477,7 +2477,18 @@ impl HostHeap {
             }
         }
         self.mirror(index, handle, false);
-        true
+        CopyMirror::Mirrored
+    }
+
+    pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
+        match self.mirror_copied_at(index, handle, record, crate::frame::current()) {
+            CopyMirror::Mirrored => true,
+            CopyMirror::Tabled => {
+                COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                false
+            }
+            CopyMirror::Unchanged => false,
+        }
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -2906,6 +2917,15 @@ type Kept = Option<ID3D12Resource>;
 fn sync_tables() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_TABLES").is_some_and(|v| v == "1"))
+}
+
+/// Outcome of [`HostHeap::mirror_copied_at`], allowing callers to tally
+/// `Tabled` hits thread-locally instead of bouncing `COPIED_TABLED` per slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CopyMirror {
+    Unchanged,
+    Mirrored,
+    Tabled,
 }
 
 /// Since the last frame line: slots on changed heap pages that

@@ -101,6 +101,9 @@ struct Card {
     /// Offsets of the copy whose bytes changed on the CPU's side and have
     /// not gone to the card's side yet.
     dirty: Mutex<Vec<(usize, usize)>>,
+    /// Lock-free hint set under `dirty` whenever new dirty ranges are pushed,
+    /// so `card_dirty()` skips clean buffers without acquiring `dirty`/`sent`.
+    has_dirty: std::sync::atomic::AtomicBool,
     /// With [`relay`]: the offsets that went from `dirty` to the card's
     /// side, each with the number of the send that took it
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
@@ -419,7 +422,11 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             .card
             .as_ref()
             .map(|c| {
+                if !c.has_dirty.load(Ordering::Acquire) {
+                    return Vec::new();
+                }
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+                c.has_dirty.store(false, Ordering::Relaxed);
                 let ranges = std::mem::take(&mut *dirty);
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
@@ -778,13 +785,44 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let n = now.len().min(held.len()).min(title.len());
     let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+    let mut i = 0;
+    while i + 32 <= n {
+        // Skip unchanged 32-byte blocks without loading `title` or dirtying
+        // cache lines in `held` (most bytes of a 64 KiB piece are unchanged).
+        // SAFETY: `i + 32 <= n`, so all 32 bytes are in bounds of `now` and `held`.
+        let unchanged = unsafe {
+            let np = now.as_ptr().add(i).cast::<u64>();
+            let hp = held.as_ptr().add(i).cast::<u64>();
+            (np.read_unaligned() ^ hp.read_unaligned())
+                | (np.add(1).read_unaligned() ^ hp.add(1).read_unaligned())
+                | (np.add(2).read_unaligned() ^ hp.add(2).read_unaligned())
+                | (np.add(3).read_unaligned() ^ hp.add(3).read_unaligned())
+                == 0
+        };
+        if !unchanged {
+            for j in i..i + 32 {
+                let nb = now[j];
+                let hb = held[j];
+                if nb != hb {
+                    differs |= nb ^ title[j];
+                    title[j] = nb;
+                    held[j] = nb;
+                }
+            }
+        }
+        i += 32;
+    }
+    while i < n {
+        let nb = now[i];
+        let hb = held[i];
+        if nb != hb {
+            differs |= nb ^ title[i];
+            title[i] = nb;
+            held[i] = nb;
+        }
+        i += 1;
     }
     differs != 0
 }
@@ -1530,6 +1568,15 @@ fn wide_threads(env: Option<&str>, cpus: usize) -> usize {
         .unwrap_or_else(|| (cpus / 2).clamp(2, 8))
 }
 
+/// Number of persistent background threads in the `wide` worker pool.
+pub(crate) fn wide_worker_count() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let cpus = std::thread::available_parallelism().map_or(8, |n| n.get());
+        wide_threads(std::env::var("VICTORY_WIDE_THREADS").ok().as_deref(), cpus)
+    })
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -1539,8 +1586,7 @@ fn workers() -> &'static Workers {
         there: std::sync::atomic::AtomicUsize::new(0),
     });
     STARTED.call_once(|| {
-        let cpus = std::thread::available_parallelism().map_or(8, |n| n.get());
-        let n = wide_threads(std::env::var("VICTORY_WIDE_THREADS").ok().as_deref(), cpus);
+        let n = wide_worker_count();
         tracing::info!(workers = n, "shadow wide worker threads configured");
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
@@ -1565,6 +1611,40 @@ fn workers() -> &'static Workers {
     workers
 }
 
+struct WideBarrier {
+    left: std::sync::atomic::AtomicUsize,
+    finished: Mutex<bool>,
+    done: std::sync::Condvar,
+}
+
+impl WideBarrier {
+    fn new(count: usize) -> Self {
+        Self {
+            left: std::sync::atomic::AtomicUsize::new(count),
+            finished: Mutex::new(false),
+            done: std::sync::Condvar::new(),
+        }
+    }
+
+    fn finish_one(&self) {
+        if self.left.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let mut finished = self.finished.lock().unwrap_or_else(|e| e.into_inner());
+            *finished = true;
+            self.done.notify_all();
+        }
+    }
+
+    fn wait_all(&self) {
+        if self.left.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut finished = self.finished.lock().unwrap_or_else(|e| e.into_inner());
+        while !*finished {
+            finished = self.done.wait(finished).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
 fn wide(jobs: Vec<Job>) {
@@ -1576,18 +1656,14 @@ fn wide(jobs: Vec<Job>) {
     }
     let workers = workers();
     let count = jobs.len();
-    let left = Arc::new((Mutex::new(count), std::sync::Condvar::new()));
+    let barrier = Arc::new(WideBarrier::new(count));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
-            let left = left.clone();
+            let barrier = barrier.clone();
             queue.push_back(Box::new(move || {
                 job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
-                }
+                barrier.finish_one();
             }));
         }
         workers.there.fetch_add(count, Ordering::AcqRel);
@@ -1607,16 +1683,48 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
-    }
+    barrier.wait_all();
 }
 
 /// [`wide`], for the host's own work on host copies (a submission's
 /// refreshes, the merge of what shaders wrote to card copies).
 pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
+}
+
+/// Runs borrowed closures `jobs` on the persistent `wide` worker pool (plus the
+/// calling thread) and waits for every closure to finish before returning,
+/// avoiding per-submission OS thread creation (`std::thread::scope`) in hot paths.
+pub(crate) fn wide_scope<'a>(jobs: Vec<Box<dyn FnOnce() + Send + 'a>>) {
+    if jobs.len() < 2 {
+        for job in jobs {
+            job();
+        }
+        return;
+    }
+    let panic: Arc<Mutex<Option<Box<dyn std::any::Any + Send>>>> = Arc::new(Mutex::new(None));
+    let erased: Vec<Job> = jobs
+        .into_iter()
+        .map(|job| {
+            // SAFETY: `wide()` blocks on `WideBarrier::wait_all()` until every
+            // closure completes (with panics caught via `catch_unwind` below)
+            // before `wide_scope` returns, so `'a` borrows stay valid.
+            let static_job: Box<dyn FnOnce() + Send + 'static> = unsafe { std::mem::transmute(job) };
+            let panic = panic.clone();
+            Box::new(move || {
+                if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(static_job)) {
+                    let mut slot = panic.lock().unwrap_or_else(|e| e.into_inner());
+                    if slot.is_none() {
+                        *slot = Some(payload);
+                    }
+                }
+            }) as Job
+        })
+        .collect();
+    wide(erased);
+    if let Some(payload) = panic.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 /// About this many bytes to a piece of work for [`wide`].
@@ -3547,6 +3655,7 @@ impl Shadow {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
         }
+        card.has_dirty.store(true, Ordering::Release);
     }
 
     /// Batches multiple `(offset, len)` dirty runs relative to `base` under one lock.
@@ -3558,17 +3667,22 @@ impl Shadow {
             return;
         }
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let mut any = false;
         for &(r, m) in runs {
             let (from, to) = (base + r, base + r + m);
             if from >= to {
                 continue;
             }
+            any = true;
             match dirty.last_mut() {
                 Some(last) if from <= last.1 && to >= last.0 => {
                     *last = (last.0.min(from), last.1.max(to));
                 }
                 _ => dirty.push((from, to)),
             }
+        }
+        if any {
+            card.has_dirty.store(true, Ordering::Release);
         }
     }
 
@@ -4066,6 +4180,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     staging: buffer,
                     before: Mutex::default(),
                     dirty: Mutex::default(),
+                    has_dirty: std::sync::atomic::AtomicBool::new(false),
                     sent: Mutex::default(),
                     size,
                 };
@@ -4433,6 +4548,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 staging: buffer,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
+                has_dirty: std::sync::atomic::AtomicBool::new(false),
                 sent: Mutex::default(),
                 size: len,
             };
@@ -4856,6 +4972,7 @@ mod card_merge_tests {
                 staging: staging.clone(),
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
+                has_dirty: std::sync::atomic::AtomicBool::new(false),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
@@ -4894,6 +5011,72 @@ mod card_merge_tests {
         assert_eq!(default_window_card_mb(Some(8 * GIB)), 737);
         assert_eq!(window_line(12 * GIB), (12 * GIB) / 10 * 8);
         assert_eq!(default_window_card_mb(Some(24 * GIB)), 1024);
+    }
+
+    #[test]
+    fn merge_piece_fast_path_matches_reference_across_boundaries() {
+        use super::merge_piece;
+        fn reference(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+            let mut differs = 0u8;
+            for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+                let wrote = if *n != *h { 0xffu8 } else { 0 };
+                let merged = (*t & !wrote) | (*n & wrote);
+                differs |= merged ^ *t;
+                *t = merged;
+                *h = (*h & !wrote) | (*n & wrote);
+            }
+            differs != 0
+        }
+
+        for len in [0usize, 1, 7, 31, 32, 33, 63, 64, 65, 129, 257] {
+            let base: Vec<u8> = (0..len).map(|i| ((i * 13 + 5) & 0xff) as u8).collect();
+            // 1) Completely unchanged: `title` keeps its distinct bytes.
+            let mut held_a = base.clone();
+            let mut title_a: Vec<u8> = base.iter().map(|b| b ^ 0xaa).collect();
+            let mut held_b = held_a.clone();
+            let mut title_b = title_a.clone();
+            assert_eq!(merge_piece(&base, &mut held_a, &mut title_a), reference(&base, &mut held_b, &mut title_b));
+            assert_eq!(held_a, held_b);
+            assert_eq!(title_a, title_b);
+
+            // 2) Sparse GPU writes spanning 32-byte chunk boundaries and tail.
+            let mut now = base.clone();
+            for pos in [0usize, 15, 31, 32, 63, 64, len.saturating_sub(1)] {
+                if pos < len {
+                    now[pos] ^= 0x3c;
+                }
+            }
+            let mut held_a = base.clone();
+            let mut title_a: Vec<u8> = base.iter().map(|b| b.wrapping_add(1)).collect();
+            // Also test case where GPU wrote the exact byte `title` already had.
+            if len > 32 {
+                title_a[32] = now[32];
+            }
+            let mut held_b = held_a.clone();
+            let mut title_b = title_a.clone();
+            assert_eq!(merge_piece(&now, &mut held_a, &mut title_a), reference(&now, &mut held_b, &mut title_b));
+            assert_eq!(held_a, held_b);
+            assert_eq!(title_a, title_b);
+        }
+    }
+
+    #[test]
+    fn wide_scope_runs_borrowed_jobs_to_completion() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let total = AtomicUsize::new(0);
+        let data: Vec<usize> = (1..=64).collect();
+        let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = data
+            .chunks(8)
+            .map(|chunk| {
+                let total = &total;
+                Box::new(move || {
+                    let s: usize = chunk.iter().sum();
+                    total.fetch_add(s, Ordering::Relaxed);
+                }) as Box<dyn FnOnce() + Send + '_>
+            })
+            .collect();
+        super::wide_scope(jobs);
+        assert_eq!(total.load(Ordering::Relaxed), 64 * 65 / 2);
     }
 }
 

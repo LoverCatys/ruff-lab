@@ -177,9 +177,11 @@ pub(crate) fn sync_heaps() {
         return;
     }
     let started = std::time::Instant::now();
+    let frame = crate::frame::current();
     let mut pages = 0u64;
     let mut looked = 0u64;
     let mut mirrored = 0u64;
+    let mut tabled = 0u64;
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped under write lock).
@@ -203,8 +205,8 @@ pub(crate) fn sync_heaps() {
                 page += crate::watch::PAGE;
             }
         }
-        let process = |chunk: &[(usize, usize)]| -> (u64, u64, u64) {
-            let (mut p, mut l, mut m) = (0u64, 0u64, 0u64);
+        let process = |chunk: &[(usize, usize)]| -> (u64, u64, u64, u64) {
+            let (mut p, mut l, mut m, mut t) = (0u64, 0u64, 0u64, 0u64);
             let mut page_bytes: Vec<u8> = Vec::with_capacity(crate::watch::PAGE);
             for &(from, to) in chunk {
                 // The page's records are read through the kernel, into a
@@ -226,41 +228,57 @@ pub(crate) fn sync_heaps() {
                         };
                         l += 1;
                         // Only a record that is not the one last seen there
-                        // (`HostHeap::mirror_copied`).
-                        if host.mirror_copied(index as u32, handle, record) {
-                            m += 1;
+                        // (`HostHeap::mirror_copied_at`), tallying tabled hits
+                        // thread-locally to avoid cross-core atomic contention.
+                        match host.mirror_copied_at(index as u32, handle, record, frame) {
+                            host::CopyMirror::Mirrored => m += 1,
+                            host::CopyMirror::Tabled => t += 1,
+                            host::CopyMirror::Unchanged => {}
                         }
                     }
                 }
             }
-            (p, l, m)
+            (p, l, m, t)
         };
         if work.len() >= 16 {
-            let threads = std::thread::available_parallelism()
-                .map_or(4, |n| (n.get() / 2).clamp(2, 6))
+            let threads = (crate::shadow::wide_worker_count() + 1)
                 .min(work.len() / 8)
                 .max(1);
-            let chunk_len = work.len().div_ceil(threads);
-            let totals: Vec<(u64, u64, u64)> = std::thread::scope(|s| {
-                let handles: Vec<_> = work
-                    .chunks(chunk_len)
-                    .map(|c| s.spawn(move || process(c)))
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap_or((0, 0, 0))).collect()
-            });
-            for (p, l, m) in totals {
-                pages += p;
-                looked += l;
-                mirrored += m;
-            }
-        } else {
-            let (p, l, m) = process(&work);
+            let chunk_len = work.len().div_ceil(threads).max(1);
+            let totals = std::sync::Mutex::new((0u64, 0u64, 0u64, 0u64));
+            let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = work
+                .chunks(chunk_len)
+                .map(|c| {
+                    let totals = &totals;
+                    let process = &process;
+                    Box::new(move || {
+                        let (p, l, m, t) = process(c);
+                        let mut acc = totals.lock().unwrap_or_else(|e| e.into_inner());
+                        acc.0 += p;
+                        acc.1 += l;
+                        acc.2 += m;
+                        acc.3 += t;
+                    }) as Box<dyn FnOnce() + Send + '_>
+                })
+                .collect();
+            crate::shadow::wide_scope(jobs);
+            let (p, l, m, t) = *totals.lock().unwrap_or_else(|e| e.into_inner());
             pages += p;
             looked += l;
             mirrored += m;
+            tabled += t;
+        } else {
+            let (p, l, m, t) = process(&work);
+            pages += p;
+            looked += l;
+            mirrored += m;
+            tabled += t;
         }
     }
     drop(heaps);
+    if tabled > 0 {
+        host::COPIED_TABLED.fetch_add(tabled, Relaxed);
+    }
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
     }
