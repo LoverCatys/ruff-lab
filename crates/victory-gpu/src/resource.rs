@@ -2193,6 +2193,19 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
+    let_go_idle_with(false);
+}
+
+/// Non-blocking urgent idle-texture sweep for `E_OUTOFMEMORY` recovery
+/// (`reclaim_for_oom`): uses `try_lock` on `TEXTURES`, `r.host.made`, and
+/// `STAGING` so it can never self-deadlock with an allocating caller.
+#[cfg(windows)]
+pub(crate) fn let_go_idle_urgent() {
+    let_go_idle_with(true);
+}
+
+#[cfg(windows)]
+fn let_go_idle_with(urgent: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2245,7 +2258,14 @@ pub(crate) fn let_go_idle() {
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
-    let all = textures();
+    let all = if urgent {
+        match TEXTURES.try_lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        }
+    } else {
+        textures()
+    };
     let mut order: Vec<(u64, usize)> = all
         .iter()
         .map(|&at| {
@@ -2268,7 +2288,14 @@ pub(crate) fn let_go_idle() {
             continue;
         }
         let gone = {
-            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let mut made = if urgent {
+                match r.host.made.try_lock() {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                }
+            } else {
+                r.host.made.lock().unwrap_or_else(|e| e.into_inner())
+            };
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
@@ -2277,8 +2304,16 @@ pub(crate) fn let_go_idle() {
             if idle {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
-                crate::texture::unstage(at as This);
-                made.take()
+                if urgent {
+                    if crate::texture::try_unstage(at as This) {
+                        made.take()
+                    } else {
+                        None
+                    }
+                } else {
+                    crate::texture::unstage(at as This);
+                    made.take()
+                }
             } else {
                 None
             }

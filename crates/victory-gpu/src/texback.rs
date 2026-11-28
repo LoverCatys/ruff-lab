@@ -103,7 +103,14 @@ pub(crate) fn let_go_idle(force: bool) {
         return;
     }
     let gone = {
-        let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = if force {
+            match SPARE.try_lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            }
+        } else {
+            SPARE.lock().unwrap_or_else(|e| e.into_inner())
+        };
         if all.1 == 0 {
             return;
         }

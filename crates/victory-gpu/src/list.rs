@@ -296,20 +296,27 @@ pub(crate) fn trim_idle(force: bool) {
     } else {
         return;
     };
-    trim_idle_to(keep);
+    trim_idle_to(keep, force);
 }
 
 /// Caps idle recycled host lists to [`IDLE_WHEN_TIGHT`] when an RDNA2 aperture
 /// segment exceeds `VICTORY_SEGMENT_TIGHT` (`klbf-lab` `680c779`).
 #[cfg(windows)]
 pub(crate) fn trim_idle_tight() {
-    trim_idle_to(IDLE_WHEN_TIGHT);
+    trim_idle_to(IDLE_WHEN_TIGHT, false);
 }
 
 #[cfg(windows)]
-fn trim_idle_to(keep: usize) {
+fn trim_idle_to(keep: usize, non_blocking: bool) {
     let gone = {
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut idle = if non_blocking {
+            match IDLE.try_lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            }
+        } else {
+            IDLE.lock().unwrap_or_else(|e| e.into_inner())
+        };
         if idle.0.len() <= keep {
             return;
         }

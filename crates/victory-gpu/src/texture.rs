@@ -119,17 +119,16 @@ struct SpareLinear(ID3D12Resource);
 unsafe impl Send for SpareLinear {}
 
 /// Immediately drains both idle staging pools (called during OOM recovery).
+/// Uses `try_lock` so OOM recovery can never deadlock with a caller holding a pool lock.
 pub(crate) fn drain_pools() {
-    let gone_upload = {
-        let mut all = SPARE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
+    let gone_upload = SPARE_UPLOAD.try_lock().ok().map(|mut all| {
         all.1 = 0;
         std::mem::take(&mut all.0)
-    };
-    let gone_linear = {
-        let mut all = SPARE_LINEAR.lock().unwrap_or_else(|e| e.into_inner());
+    });
+    let gone_linear = SPARE_LINEAR.try_lock().ok().map(|mut all| {
         all.1 = 0;
         std::mem::take(&mut all.0)
-    };
+    });
     drop(gone_upload);
     drop(gone_linear);
 }
@@ -638,10 +637,15 @@ fn let_go_idle_with(urgent: bool) {
     let shared_pressure = crate::host::shared_memory_pressure();
     let avail_ram = crate::host::available_physical_ram();
     if urgent || shared_pressure >= 1 || avail_ram.is_some_and(|free| free < PRESSURE_RAM) {
-        let gone_upload = {
+        let gone_upload = if urgent {
+            SPARE_UPLOAD.try_lock().ok().map(|mut all| {
+                all.1 = 0;
+                std::mem::take(&mut all.0)
+            })
+        } else {
             let mut all = SPARE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
             all.1 = 0;
-            std::mem::take(&mut all.0)
+            Some(std::mem::take(&mut all.0))
         };
         drop(gone_upload);
     }
@@ -649,21 +653,41 @@ fn let_go_idle_with(urgent: bool) {
         .and_then(|h| h.video_memory())
         .is_some_and(|[budget, used, ..]| budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 85);
     if urgent || vram_high || shared_pressure >= 2 {
-        let gone_linear = {
+        let gone_linear = if urgent {
+            SPARE_LINEAR.try_lock().ok().map(|mut all| {
+                all.1 = 0;
+                std::mem::take(&mut all.0)
+            })
+        } else {
             let mut all = SPARE_LINEAR.lock().unwrap_or_else(|e| e.into_inner());
             all.1 = 0;
-            std::mem::take(&mut all.0)
+            Some(std::mem::take(&mut all.0))
         };
         drop(gone_linear);
     }
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    // During urgent OOM recovery, never block on `STAGING` or per-staging `mem`
+    // locks so an allocating caller cannot self-deadlock.
+    let mut map = if urgent {
+        match STAGING.try_lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        }
+    } else {
+        STAGING.lock().unwrap_or_else(|e| e.into_inner())
+    };
     let Some(map) = map.as_mut() else {
         return;
     };
     if map.is_empty() {
         return;
     }
+    let ram_pressured = shared_pressure >= 1 || avail_ram.is_some_and(|free| free < PRESSURE_RAM);
     let idle_ms = if urgent { 0 } else { crate::host::ram_idle_ms(avail_ram) };
+    // Under shared-GPU or physical-RAM pressure, lighten uploaded staging
+    // buffers after 2 frames / 250 ms instead of 30 frames / 2 s (at 3 FPS
+    // 30 frames is 10 s, letting hundreds of MB of upload buffers pile up).
+    let unchanged_ms = if ram_pressured { 250 } else { UNCHANGED_MS };
+    let unchanged_frames = if ram_pressured { 2 } else { UNCHANGED_FRAMES };
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
@@ -675,14 +699,22 @@ fn let_go_idle_with(urgent: bool) {
         // A texture still sampled but uploaded and unchanged for a while:
         // its buffer goes, its record (hash, flags) stays, so it is neither
         // uploaded again nor detiled again until its memory changes.
-        if keep
+        let took_mem = if keep
             && (lighten || urgent)
             && Arc::strong_count(s) == 1
             && s.uploaded.load(Relaxed)
             && !s.dirty.load(Relaxed)
-            && (urgent || crate::host::long_ago(s.changed.load(Relaxed), UNCHANGED_MS, UNCHANGED_FRAMES))
-            && s.mem.lock().unwrap_or_else(|e| e.into_inner()).take().is_some()
+            && (urgent || crate::host::long_ago(s.changed.load(Relaxed), unchanged_ms, unchanged_frames))
         {
+            if urgent {
+                s.mem.try_lock().ok().and_then(|mut m| m.take()).is_some()
+            } else {
+                s.mem.lock().unwrap_or_else(|e| e.into_inner()).take().is_some()
+            }
+        } else {
+            false
+        };
+        if took_mem {
             LIGHTENED[0].fetch_add(1, Relaxed);
             LIGHTENED[1].fetch_add(s.bytes, Relaxed);
         }
@@ -1477,6 +1509,19 @@ pub(crate) fn unstage(resource: This) {
     }
 }
 
+/// Non-blocking [`unstage`] for urgent OOM recovery (`resource::let_go_idle_urgent`).
+/// Returns `false` if `STAGING` is currently locked, so the caller leaves the
+/// host texture intact rather than risking a deadlock.
+pub(crate) fn try_unstage(resource: This) -> bool {
+    let Ok(mut map) = STAGING.try_lock() else {
+        return false;
+    };
+    if let Some(map) = map.as_mut() {
+        map.remove(&(resource as usize));
+    }
+    true
+}
+
 /// Where a staged title texture's memory is: address and bytes.
 pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -1779,11 +1824,15 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     // buffer with its texture's host side locked, in that order.
     let on_demand = crate::resource::host_tiled(resource).is_some();
     let dropped = crate::resource::dropped(resource);
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize)) {
-        return Some(s.clone());
+    {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = map.as_ref().and_then(|m| m.get(&(resource as usize))) {
+            return Some(s.clone());
+        }
     }
+    // Allocate staging/detile buffers outside `STAGING` lock so OOM recovery
+    // (`reclaim_for_oom` -> `texture::let_go_idle_urgent`) cannot self-deadlock
+    // and concurrent recording threads are not serialized on D3D12 allocations.
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -1867,8 +1916,6 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         )
     });
     tracing::debug!(?desc, total, upload_bytes, "texture contents uploaded from title memory");
-    STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    STAGED[1].fetch_add(upload_bytes, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         mem: Mutex::new(Some(StagingMem {
             buffer,
@@ -1898,8 +1945,39 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
     });
-    map.insert(resource as usize, s.clone());
-    Some(s)
+    let mut inserted = false;
+    let winner = {
+        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        map.get_or_insert_with(HashMap::new)
+            .entry(resource as usize)
+            .or_insert_with(|| {
+                inserted = true;
+                s.clone()
+            })
+            .clone()
+    };
+    if inserted {
+        STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        STAGED[1].fetch_add(upload_bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+    // If another thread inserted concurrently, drop our spare staging outside `STAGING`.
+    drop(s);
+    Some(winner)
+}
+
+#[cfg(test)]
+mod oom_reclaim_tests {
+    use super::{STAGING, drain_pools, let_go_idle_urgent, try_unstage};
+
+    /// Regression test: urgent OOM reclamation must never self-deadlock even if
+    /// the calling thread already holds `STAGING`.
+    #[test]
+    fn urgent_reclaim_does_not_deadlock_while_staging_locked() {
+        let _guard = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        drain_pools();
+        let_go_idle_urgent();
+        assert!(!try_unstage(std::ptr::null()));
+    }
 }
 
 #[cfg(test)]

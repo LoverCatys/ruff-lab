@@ -1451,15 +1451,14 @@ fn let_go_idle_snapshots() {
 /// Immediately empties the snapshot and exact-copy reuse pools (called during
 /// OOM recovery).
 pub(crate) fn drain_pools() {
-    let gone_snaps = {
-        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *pool)
-    };
-    let gone_exact = {
-        let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let gone_snaps = POOL
+        .try_lock()
+        .ok()
+        .map(|mut pool| std::mem::take(&mut *pool));
+    let gone_exact = EXACT_POOL.try_lock().ok().map(|mut pool| {
         pool.1 = 0;
         std::mem::take(&mut pool.0)
-    };
+    });
     drop(gone_snaps);
     drop(gone_exact);
 }
@@ -2735,7 +2734,16 @@ fn let_go_idle_with(urgent: bool) {
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
-        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        // During urgent OOM recovery, never block on `LOOSE` in case the
+        // allocating caller already holds it (prevents self-deadlock).
+        let mut map = if urgent {
+            match LOOSE.try_write() {
+                Ok(g) => g,
+                Err(_) => return,
+            }
+        } else {
+            LOOSE.write().unwrap_or_else(|e| e.into_inner())
+        };
         if map.is_empty() {
             return;
         }
@@ -2768,6 +2776,20 @@ fn let_go_idle_with(urgent: bool) {
         // Nothing runs now and nothing names it: freed at once unless a
         // submission is running after all.
         crate::host::retire(shadow);
+    }
+}
+
+#[cfg(test)]
+mod oom_reclaim_tests {
+    use super::{LOOSE, drain_pools, let_go_idle_urgent};
+
+    /// Regression test: urgent OOM reclamation must never self-deadlock even if
+    /// the calling thread already holds `LOOSE.write()`.
+    #[test]
+    fn urgent_reclaim_does_not_deadlock_while_loose_locked() {
+        let _guard = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        drain_pools();
+        let_go_idle_urgent();
     }
 }
 

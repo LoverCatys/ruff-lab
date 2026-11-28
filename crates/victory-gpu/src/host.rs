@@ -287,7 +287,14 @@ fn sweep() {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);
-    if now < last + 1000
+    let min_gap = if shared_memory_pressure() >= 2
+        || available_physical_ram().is_some_and(|free| free < 2 * (1024 << 20))
+    {
+        400
+    } else {
+        1000
+    };
+    if now < last + min_gap
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
@@ -1734,7 +1741,14 @@ fn trim_scratch_pool(force: bool) {
         return;
     }
     let freed = {
-        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spare = if force {
+            match SPARE.try_lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            }
+        } else {
+            SPARE.lock().unwrap_or_else(|e| e.into_inner())
+        };
         if spare.kept.is_empty() {
             return;
         }
@@ -1788,7 +1802,7 @@ impl Host {
         crate::pipeline::trim_library();
         crate::shadow::let_go_idle_urgent();
         crate::texture::let_go_idle_urgent();
-        crate::resource::let_go_idle();
+        crate::resource::let_go_idle_urgent();
         bury(FINISHED.load(Ordering::Acquire));
     }
 }
