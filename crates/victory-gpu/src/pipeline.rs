@@ -60,7 +60,14 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
-    container: Vec<u8>,
+    /// Original container byte size (preserved after raw bytes are freed on translation).
+    size: usize,
+    /// Raw console shader container, freed after first translation to save system RAM
+    /// (`Marvisak/VIctory#3658`).
+    container: Mutex<Option<Vec<u8>>>,
+    /// Cached result of whether a compute shader spills (structure builder).
+    #[cfg(windows)]
+    spilled: OnceLock<bool>,
     /// Its result gets the least indirect light ([`crate::ambient`]).
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
@@ -262,7 +269,10 @@ impl Shader {
         Shader {
             stage,
             hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
-            container: bytes.to_vec(),
+            size: bytes.len(),
+            container: Mutex::new(Some(bytes.to_vec())),
+            #[cfg(windows)]
+            spilled: OnceLock::new(),
             #[cfg(windows)]
             resolves_light: bytes
                 .windows(crate::ambient::PROGRAM.len())
@@ -298,22 +308,55 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    /// Whether this compute shader uses spilled memory (structure builder),
+    /// cached before the raw container bytes are freed on first translation.
+    fn is_spilled(&self) -> bool {
+        *self.spilled.get_or_init(|| {
+            use victory_shader::{Container, FourCC};
+            if self.stage != "compute" {
+                return false;
+            }
+            let guard = self.container.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(bytes) = guard.as_deref() else {
+                return false;
+            };
+            let Ok(c) = Container::parse(bytes) else {
+                return false;
+            };
+            c.part(FourCC::DXIL)
+                .and_then(|part| victory_shader::native_programs(part.data).ok())
+                .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+        })
+    }
+
     /// The translation, made on first use; a shader that does not
-    /// translate is logged once.
+    /// translate is logged once. Frees the raw container bytes once translated.
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let _ = self.is_spilled();
+                let container = self
+                    .container
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                    .unwrap_or_default();
+                let raw_len = container.len() as u64;
+                let done = translate(&container);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
                     let dir = std::path::PathBuf::from(dir);
                     let _ = std::fs::create_dir_all(&dir);
                     let stem = format!("{}.{}", self.hash, self.stage);
-                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
+                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &container);
                     if let Ok(t) = &done {
                         let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
                     }
+                }
+                drop(container);
+                if raw_len > 0 {
+                    KEPT[1].fetch_sub(raw_len, std::sync::atomic::Ordering::Relaxed);
                 }
                 if let Ok(t) = &done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -405,17 +448,8 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
-    use victory_shader::{Container, FourCC};
     let [shader] = shaders else { return false };
-    if shader.stage != "compute" {
-        return false;
-    }
-    let Ok(c) = Container::parse(&shader.container) else {
-        return false;
-    };
-    c.part(FourCC::DXIL)
-        .and_then(|part| victory_shader::native_programs(part.data).ok())
-        .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+    shader.is_spilled()
 }
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
@@ -548,7 +582,7 @@ pub(crate) fn bound(this: This) {
     }
     let frame = crate::frame::current();
     for shader in &p.shaders {
-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.size, hash = %shader.hash, "first bind");
     }
 }
 
@@ -561,6 +595,16 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// Like [`host_pipeline`], for compute dispatches (grants a dedicated
+/// first-dispatch wait for the head blend-shape shader, `Vice-Tay#372`).
+#[cfg(windows)]
+pub(crate) fn host_dispatch_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    make::ready_dispatch(&pipeline(this).host)
 }
 
 /// Host pipelines queued and not made yet.
@@ -1195,7 +1239,7 @@ mod tests {
         pipeline(p)
             .shaders
             .iter()
-            .map(|s| (s.stage, s.container.clone()))
+            .map(|s| (s.stage, s.container.lock().unwrap().clone().unwrap_or_default()))
             .collect()
     }
 

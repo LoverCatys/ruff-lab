@@ -23,6 +23,17 @@ use std::time::{Duration, Instant};
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
 
+/// Compute shader hash for the character head blend-shape pass
+/// (`TaynanGT/Vice-Tay#372`, `3e3fd57`), waited for up to 2 s on first dispatch
+/// so facial blend-shapes are never skipped (`VICTORY_HEAD_MAP_WAIT=0` disables).
+const HEAD_MAP_HASH: &str = "61e54e90adccaf6a";
+const HEAD_MAP_WAIT: Duration = Duration::from_secs(2);
+
+fn head_map_wait_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAD_MAP_WAIT").is_none_or(|v| v != "0"))
+}
+
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
@@ -33,6 +44,10 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     pub(crate) key: String,
     used: AtomicBool,
+    /// Whether this is the character head blend-shape compute shader.
+    is_head_map: bool,
+    /// Whether the one-time first-dispatch head-map wait has already run.
+    head_waited: AtomicBool,
     /// When a worker began it ([`slow`]).
     begun: OnceLock<Instant>,
     /// Microseconds frames have waited for this pipeline in all (`VICTORY_PIPELINE_WAIT_CAP_MS`).
@@ -63,6 +78,8 @@ impl Pending {
     }
 
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+        let is_head_map = graphics.is_none()
+            && matches!(shaders.as_slice(), [s] if s.stage == "compute" && s.hash == HEAD_MAP_HASH);
         Pending {
             key: key(&shaders, graphics.as_deref()),
             shaders,
@@ -70,6 +87,8 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
             used: AtomicBool::new(false),
+            is_head_map,
+            head_waited: AtomicBool::new(false),
             begun: OnceLock::new(),
             waited_us: AtomicU64::new(0),
         }
@@ -207,6 +226,44 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
+}
+
+/// Like [`ready`], for compute dispatches: gives the character head
+/// blend-shape pipeline (`61e54e90adccaf6a`) a dedicated 2 s wait on its
+/// first dispatch so facial blend-shapes are ready even if the frame's general
+/// pipeline wait budget was already spent (`Vice-Tay#372`).
+pub(crate) fn ready_dispatch(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.is_head_map
+        && head_map_wait_on()
+        && p.made.get().is_none()
+        && !p.head_waited.swap(true, Ordering::Relaxed)
+    {
+        if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
+            super::library::note_used(&p.key);
+        }
+        start(p, REQUESTED);
+        let started = Instant::now();
+        let (lock, done) = &DONE;
+        let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while p.made.get().is_none() {
+            let rest = HEAD_MAP_WAIT.saturating_sub(started.elapsed());
+            if rest.is_zero() {
+                break;
+            }
+            held = done
+                .wait_timeout(held, rest.min(Duration::from_millis(100)))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        drop(held);
+        tracing::info!(
+            ms = started.elapsed().as_millis(),
+            ready = p.made.get().is_some_and(Option::is_some),
+            "head blend-shape pipeline first-dispatch wait finished"
+        );
+        return p.made.get()?.as_ref();
+    }
+    ready(p)
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker

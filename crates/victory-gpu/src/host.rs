@@ -1784,8 +1784,8 @@ impl Host {
         crate::shadow::drain_pools();
         crate::list::trim_idle(true);
         crate::pipeline::trim_library();
-        crate::shadow::let_go_idle();
-        crate::texture::let_go_idle();
+        crate::shadow::let_go_idle_urgent();
+        crate::texture::let_go_idle_urgent();
         crate::resource::let_go_idle();
         bury(FINISHED.load(Ordering::Acquire));
     }
@@ -5357,7 +5357,8 @@ impl Host {
         // sweep waits for a submission that finds none in the air: there is
         // one at every present).
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let sweep_gap = if shared_memory_pressure() >= 2 { 500 } else { 1500 };
+        let ram_tight = available_physical_ram().is_some_and(|free| free < 2 * (1024 << 20));
+        let sweep_gap = if shared_memory_pressure() >= 2 || ram_tight { 500 } else { 1500 };
         if !behind {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);

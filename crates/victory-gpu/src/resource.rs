@@ -1171,6 +1171,19 @@ pub(crate) struct HostTexture {
     pub(crate) dropped: u32,
 }
 
+#[cfg(windows)]
+impl HostTexture {
+    /// Bytes of VRAM this host texture actually holds: for tiled
+    /// (`VICTORY_LEVELS_ON_DEMAND`) textures, the mapped tile bytes rather than
+    /// `0` (`MiniVI#12`, `klbf-lab#46`).
+    pub(crate) fn card_bytes(&self) -> u64 {
+        match &self.tiled {
+            Some(tiled) => tiled.given_bytes(),
+            None => self.bytes,
+        }
+    }
+}
+
 /// What a title texture has on the host: its host copy and, for a depth
 /// texture shaders also write, the colour twin.
 #[cfg(windows)]
@@ -1522,6 +1535,21 @@ pub(crate) fn room() -> bool {
             used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
+    }
+}
+
+/// Whether `bytes` more fits under 95% of the card's DXGI budget, ignoring
+/// general texture-queue reserve cushions — used for urgent decoration/face
+/// bake source uploads (`fxceless/victory-fork#1422`) so character faces never
+/// bake black while the card still has real headroom.
+#[cfg(windows)]
+pub(crate) fn within_budget(bytes: u64) -> bool {
+    if commit_short(50) {
+        return false;
+    }
+    match crate::host::host().and_then(|h| h.video_memory()) {
+        Some([budget, used, ..]) if budget > 0 => used.saturating_add(bytes) < budget / 100 * 95,
+        _ => room(),
     }
 }
 
@@ -2253,12 +2281,13 @@ pub(crate) fn let_go_idle() {
             }
         };
         if let Some((host, _)) = gone {
+            let freed = host.card_bytes();
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
+            KINDS[3].fetch_add(freed, Relaxed);
             went += 1;
-            bytes += host.bytes;
-            over = over.saturating_sub(host.bytes);
+            bytes += freed;
+            over = over.saturating_sub(freed);
             if first.is_none() {
                 first = Some(at);
             }

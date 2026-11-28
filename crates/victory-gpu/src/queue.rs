@@ -59,6 +59,12 @@ enum Held {
 #[cfg(windows)]
 static WAITING: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
+/// Serializes `release_held` against `Queue::Release` teardown so a released
+/// queue is removed from `WAITING` before its `Box<Queue>` is freed (`klbf-lab` `ef147e3`).
+/// Lock order: `RELEASING` -> `WAITING`.
+#[cfg(windows)]
+static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(windows)]
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -308,7 +314,6 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
 #[cfg(windows)]
 pub(crate) fn release_held(all: bool) {
     // One caller at a time, so a queue's submissions keep their order.
-    static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
         return;
     }
@@ -503,12 +508,17 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     )
 }
 extern "system" fn release(this: This) -> u32 {
-    let left = object::release_boxed::<Queue>(this);
     #[cfg(windows)]
-    if left == 0 {
-        lock(&WAITING).retain(|&q| q != this as usize);
+    {
+        object::release_boxed_with::<Queue>(this, || {
+            let _one = lock(&RELEASING);
+            lock(&WAITING).retain(|&q| q != this as usize);
+        })
     }
-    left
+    #[cfg(not(windows))]
+    {
+        object::release_boxed::<Queue>(this)
+    }
 }
 
 /// Runs the lists' host lists and waits for them (decision 0007). A queue

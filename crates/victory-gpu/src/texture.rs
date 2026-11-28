@@ -621,12 +621,23 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// texture makes a staging buffer anew, detiles and uploads once more.
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
+    let_go_idle_with(false);
+}
+
+/// Aggressive staging-buffer reclamation for `E_OUTOFMEMORY` recovery: drops
+/// spare pools and immediately lightens every unreferenced uploaded staging
+/// buffer (0 ms grace) before retrying a failed allocation.
+pub(crate) fn let_go_idle_urgent() {
+    let_go_idle_with(true);
+}
+
+fn let_go_idle_with(urgent: bool) {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
+    let idle_frames: u64 = if urgent { 1 } else { 4 };
     const PRESSURE_RAM: u64 = 3 * (1024 << 20);
     let shared_pressure = crate::host::shared_memory_pressure();
     let avail_ram = crate::host::available_physical_ram();
-    if shared_pressure >= 1 || avail_ram.is_some_and(|free| free < PRESSURE_RAM) {
+    if urgent || shared_pressure >= 1 || avail_ram.is_some_and(|free| free < PRESSURE_RAM) {
         let gone_upload = {
             let mut all = SPARE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
             all.1 = 0;
@@ -637,7 +648,7 @@ pub(crate) fn let_go_idle() {
     let vram_high = crate::host::host()
         .and_then(|h| h.video_memory())
         .is_some_and(|[budget, used, ..]| budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 85);
-    if vram_high || shared_pressure >= 2 {
+    if urgent || vram_high || shared_pressure >= 2 {
         let gone_linear = {
             let mut all = SPARE_LINEAR.lock().unwrap_or_else(|e| e.into_inner());
             all.1 = 0;
@@ -652,7 +663,7 @@ pub(crate) fn let_go_idle() {
     if map.is_empty() {
         return;
     }
-    let idle_ms = crate::host::ram_idle_ms(avail_ram);
+    let idle_ms = if urgent { 0 } else { crate::host::ram_idle_ms(avail_ram) };
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
@@ -660,16 +671,16 @@ pub(crate) fn let_go_idle() {
     let lighten = !staging_keep();
     map.retain(|_, s| {
         let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
+            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, idle_frames);
         // A texture still sampled but uploaded and unchanged for a while:
         // its buffer goes, its record (hash, flags) stays, so it is neither
         // uploaded again nor detiled again until its memory changes.
         if keep
-            && lighten
+            && (lighten || urgent)
             && Arc::strong_count(s) == 1
             && s.uploaded.load(Relaxed)
             && !s.dirty.load(Relaxed)
-            && crate::host::long_ago(s.changed.load(Relaxed), UNCHANGED_MS, UNCHANGED_FRAMES)
+            && (urgent || crate::host::long_ago(s.changed.load(Relaxed), UNCHANGED_MS, UNCHANGED_FRAMES))
             && s.mem.lock().unwrap_or_else(|e| e.into_inner()).take().is_some()
         {
             LIGHTENED[0].fetch_add(1, Relaxed);

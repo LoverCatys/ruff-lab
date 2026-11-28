@@ -2569,10 +2569,25 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
-    const IDLE_FRAMES: u64 = 4;
+    let_go_idle_with(false);
+}
+
+/// Aggressive loose-window reclamation for `E_OUTOFMEMORY` recovery: drops
+/// idle time to 0 ms (1-frame grace) so unreferenced L0 `shared_buffer`
+/// windows are freed immediately before retrying a failed allocation.
+pub(crate) fn let_go_idle_urgent() {
+    let_go_idle_with(true);
+}
+
+fn let_go_idle_with(urgent: bool) {
+    let idle_frames: u64 = if urgent { 1 } else { 4 };
     // Before the windows: their table may be empty while the snapshot/exact pools are not.
-    let_go_idle_snapshots();
-    let_go_idle_exact_pool();
+    if urgent {
+        drain_pools();
+    } else {
+        let_go_idle_snapshots();
+        let_go_idle_exact_pool();
+    }
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -2580,12 +2595,16 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        let idle_ms = if urgent {
+            0
+        } else {
+            crate::host::ram_idle_ms(crate::host::available_physical_ram())
+        };
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, idle_frames)
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(key, _)| *key)
