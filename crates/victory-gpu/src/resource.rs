@@ -2233,8 +2233,10 @@ fn let_go_idle_with(urgent: bool) {
     // `VICTORY_TEXTURE_LRU=1` (from PastiiJay/klbf-lab `0ea9755`, after
     // AKA0GHOST/victory-fork e3aa169 & 7daa701): evict oldest idle copies
     // first, stopping once video memory drops under `VICTORY_TEXTURE_KEEP_PERCENT`
-    // (default `room_percent - 5`), while still letting go copies idle for 30 s.
-    const LONG_MS: u64 = 30_000;
+    // (default `room_percent - 5`), while still letting go copies idle for 3 min
+    // (long enough that pausing 1-2 minutes does not flush thousands of active
+    // world textures and trigger an unpause detile/tile-mapping storm).
+    const LONG_MS: u64 = 180_000;
     static LRU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let lru = *LRU.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LRU").is_some_and(|v| v == "1"));
     static KEEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();

@@ -424,8 +424,9 @@ pub(crate) fn removal_context() -> String {
         FINISHED.load(Ordering::Relaxed),
     );
     let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = write!(text, "; the last {} things done, newest last:", trail.len());
-    for (at, thread, what) in trail.iter() {
+    let shown = trail.len().min(32);
+    let _ = write!(text, "; the last {shown} of {} things done, newest first:", trail.len());
+    for (at, thread, what) in trail.iter().rev().take(shown) {
         let _ = write!(text, "\n  {:.1} ms before, thread {thread}: {what}", ms(*at));
     }
     text
@@ -1519,12 +1520,13 @@ fn record_twin_copy(
     }
 }
 
-/// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
-/// builds).
+/// Whether device-removed extended data (DRED breadcrumbs + hardware page-fault
+/// VA + resource names) is on (`VICTORY_D3D12_DRED=1`). Off by default (0%
+/// overhead); works in both release and diagnostics builds when explicitly set.
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+        std::env::var_os("VICTORY_D3D12_DRED").is_some_and(|v| v != "0")
     })
 }
 
@@ -7381,8 +7383,11 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 impl Host {
     /// The queue everything of ours runs on, for a call that must go to it
     /// in order with the lists (`crate::tiles`: a texture's levels are
-    /// given memory ahead of the list that uploads them).
+    /// given memory ahead of the list that uploads them). Waits for
+    /// `victory-send` first so `UpdateTileMappings` never races with or
+    /// overtakes pending `ExecuteCommandLists` calls (`VICTORY_SEND_THREAD=1`).
     pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
+        send_thread::wait_idle();
         &self.queue
     }
 

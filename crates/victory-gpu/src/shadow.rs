@@ -4658,16 +4658,16 @@ fn recent_reach(from: u64, limit: u64) -> u64 {
 
 /// The window of an ask without a length at `[address, end)`: its 4 MiB
 /// cell, and on past it while the title's memory stays committed, up to
-/// [`root_window_most`]. Dynamically tightens under WDDM shared-RAM or
-/// physical-RAM pressure so 16 GB PCs stay clear of the ~7.5 GiB L0 ceiling.
+/// [`root_window_most`]. Preserves AMD-safe reach (up to 16 MiB by default)
+/// so unsized root views do not page-fault; only trims to 8 MiB under severe
+/// RAM exhaustion (4 MiB fallback happens only if `shared_buffer` actually
+/// returns `None`).
 fn root_window(address: u64, end: u64) -> (u64, u64) {
     let (cell, len) = window_of(address, end, WINDOW);
     let mut most = root_window_most();
     let shared_pressure = crate::host::shared_memory_pressure();
     let avail = crate::host::available_physical_ram();
-    if shared_pressure >= 2 || avail.is_some_and(|free| free < 2 * (1024 << 20)) {
-        most = most.min(WINDOW);
-    } else if shared_pressure >= 1 || avail.is_some_and(|free| free < 3 * (1024 << 20)) {
+    if shared_pressure >= 2 && avail.is_some_and(|free| free < 1536 << 20) {
         most = most.min(2 * WINDOW);
     }
     if most <= len {
