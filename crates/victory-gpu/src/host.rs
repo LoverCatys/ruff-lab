@@ -1704,12 +1704,17 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
         return;
     }
+    let cap = match shared_memory_pressure() {
+        2 => 16 << 20,
+        1 => 32 << 20,
+        _ => SPARE_MOST,
+    };
     let mut freed = Vec::new();
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, SPARE_MOST)
+                spare.give(chunk, size, cap)
             } else {
                 Some(chunk)
             };
@@ -1735,7 +1740,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
 fn trim_scratch_pool(force: bool) {
     const PRESSURE_RAM: u64 = 3 * (1024 << 20);
     if !force
-        && shared_memory_pressure() < 2
+        && shared_memory_pressure() < 1
         && !available_physical_ram().is_some_and(|free| free < PRESSURE_RAM)
     {
         return;
@@ -1780,6 +1785,9 @@ impl Host {
             return;
         }
         *last = now;
+        let (shadows_mb, loose_windows, loose_mb) = crate::shadow::shared_ram_summary();
+        let idle_lists = crate::list::idle_count();
+        let scratch_mb = ALIVE[2].load(Ordering::Relaxed) >> 20;
         if let Some([lb, lu, sb, su]) = self.video_memory() {
             tracing::warn!(
                 why,
@@ -1788,10 +1796,23 @@ impl Host {
                 shared_used_mb = su >> 20,
                 shared_budget_mb = sb >> 20,
                 avail_ram_mb = available_physical_ram().unwrap_or(0) >> 20,
+                shadows_mb,
+                loose_windows,
+                loose_mb,
+                idle_lists,
+                scratch_mb,
                 "E_OUTOFMEMORY: draining idle GPU/L0 pools and burying retired objects before retry"
             );
         } else {
-            tracing::warn!(why, "E_OUTOFMEMORY: draining idle GPU/L0 pools before retry");
+            tracing::warn!(
+                why,
+                shadows_mb,
+                loose_windows,
+                loose_mb,
+                idle_lists,
+                scratch_mb,
+                "E_OUTOFMEMORY: draining idle GPU/L0 pools before retry"
+            );
         }
         bury(FINISHED.load(Ordering::Acquire));
         trim_scratch_pool(true);

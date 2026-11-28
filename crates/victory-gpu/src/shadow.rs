@@ -2793,6 +2793,26 @@ mod oom_reclaim_tests {
     }
 }
 
+/// Lightweight non-blocking shared-RAM summary `(live_shadows_mb, loose_count, loose_mb)`
+/// for `E_OUTOFMEMORY` diagnostics.
+pub(crate) fn shared_ram_summary() -> (u64, usize, u64) {
+    let live_mb = LIVE[1].load(Ordering::Relaxed) >> 20;
+    let (loose_count, loose_mb) = LOOSE
+        .try_read()
+        .ok()
+        .map(|loose| {
+            let mut seen = std::collections::HashSet::new();
+            let bytes: u64 = loose
+                .values()
+                .filter(|s| seen.insert(Arc::as_ptr(s) as usize))
+                .map(|s| s.len)
+                .sum();
+            (seen.len(), bytes >> 20)
+        })
+        .unwrap_or((0, 0));
+    (live_mb, loose_count, loose_mb)
+}
+
 /// For the memory line: host copies alive and their bytes, of them the
 /// windows of memory outside buffers and their bytes, and the snapshot
 /// buffers kept for reuse and the bytes they reserve.
@@ -4638,11 +4658,18 @@ fn recent_reach(from: u64, limit: u64) -> u64 {
 
 /// The window of an ask without a length at `[address, end)`: its 4 MiB
 /// cell, and on past it while the title's memory stays committed, up to
-/// [`root_window_most`]. Prevents AMD DRED page faults when a root view
-/// reads past a single 4 MiB cell into a larger committed allocation.
+/// [`root_window_most`]. Dynamically tightens under WDDM shared-RAM or
+/// physical-RAM pressure so 16 GB PCs stay clear of the ~7.5 GiB L0 ceiling.
 fn root_window(address: u64, end: u64) -> (u64, u64) {
     let (cell, len) = window_of(address, end, WINDOW);
-    let most = root_window_most();
+    let mut most = root_window_most();
+    let shared_pressure = crate::host::shared_memory_pressure();
+    let avail = crate::host::available_physical_ram();
+    if shared_pressure >= 2 || avail.is_some_and(|free| free < 2 * (1024 << 20)) {
+        most = most.min(WINDOW);
+    } else if shared_pressure >= 1 || avail.is_some_and(|free| free < 3 * (1024 << 20)) {
+        most = most.min(2 * WINDOW);
+    }
     if most <= len {
         return (cell, len);
     }
@@ -4723,34 +4750,59 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             return Some(shadow.clone());
         }
     }
-    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-    let (start, len) = if unsized_ask && tails() {
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if unsized_ask && root_most > WINDOW {
-        let there = map.range((reach_base, 0)..=(cell, u64::MAX)).map(|(key, _)| *key);
-        reuse_root(there, address, cell, named.0 + named.1, root_most).unwrap_or(named)
-    } else if any && (fine() || root_most > WINDOW) && !unsized_ask {
-        // The windows starting at or below the ask (including extended root
-        // windows) that already cover `[address, end)`.
-        let there = map.range((reach_base, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
-    } else {
-        named
+    let (mut start, mut len) = {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        let (start, len) = if unsized_ask && tails() {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
+        } else if unsized_ask && root_most > WINDOW {
+            let there = map.range((reach_base, 0)..=(cell, u64::MAX)).map(|(key, _)| *key);
+            reuse_root(there, address, cell, named.0 + named.1, root_most).unwrap_or(named)
+        } else if any && (fine() || root_most > WINDOW) && !unsized_ask {
+            let there = map.range((reach_base, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            holder(there, address, end).unwrap_or(named)
+        } else {
+            named
+        };
+        if let Some(shadow) = map.get(&(start, len)) {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+        (start, len)
     };
-    if let Some(shadow) = map.get(&(start, len)) {
-        note(shadow);
-        return Some(shadow.clone());
-    }
-    // In place, if asked for and the window's memory can be opened: the
-    // window is the title's own memory, with nothing to copy.
+    // Allocate outside `LOOSE` so `reclaim_for_oom` -> `shadow::let_go_idle_urgent()`
+    // can actually evict idle loose windows before retrying, and so concurrent
+    // recording threads are not blocked on D3D12 allocations.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
+        let winner = {
+            let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+            let entry = map.entry((start, len)).or_insert_with(|| shadow.clone()).clone();
+            note(&entry);
+            entry
+        };
+        drop(shadow);
+        return Some(winner);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    let host = host()?;
+    let (buffer, data) = match host.shared_buffer(len) {
+        Some(b) => b,
+        None if len > WINDOW && unsized_ask => {
+            // Extended root window (8–16 MiB) failed under L0 shared-RAM pressure:
+            // fall back to the single 4 MiB cell covering `[address, end)`.
+            let fallback = window_of(address, end, WINDOW);
+            {
+                let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+                if let Some(shadow) = map.get(&fallback) {
+                    note(shadow);
+                    return Some(shadow.clone());
+                }
+            }
+            (start, len) = fallback;
+            host.shared_buffer(len)?
+        }
+        None => return None,
+    };
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side.
@@ -4780,12 +4832,24 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.window = true;
     shadow.card = card;
     let shadow = Arc::new(shadow);
-    if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    let mut inserted = false;
+    let winner = {
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let entry = map
+            .entry((start, len))
+            .or_insert_with(|| {
+                inserted = true;
+                shadow.clone()
+            })
+            .clone();
+        note(&entry);
+        entry
+    };
+    if inserted && winner.card.is_some() {
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&winner));
     }
-    note(&shadow);
-    map.insert((start, len), shadow.clone());
-    Some(shadow)
+    drop(shadow);
+    Some(winner)
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,

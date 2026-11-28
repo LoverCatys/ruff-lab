@@ -288,13 +288,33 @@ const IDLE_WHEN_TIGHT: usize = 64;
 /// shared GPU memory / RDNA2 2 GB aperture) under memory pressure, tight
 /// aperture, or during OOM recovery.
 #[cfg(windows)]
+fn idle_cap_now() -> usize {
+    let sp = crate::host::shared_memory_pressure();
+    let avail = crate::host::available_physical_ram();
+    if sp >= 2 || avail.is_some_and(|free| free < 2 * (1024 << 20)) {
+        4
+    } else if sp >= 1 || avail.is_some_and(|free| free < 3 * (1024 << 20)) {
+        16
+    } else {
+        IDLE_MOST.0
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn idle_count() -> usize {
+    IDLE.try_lock().ok().map_or(0, |idle| idle.0.len())
+}
+
+#[cfg(windows)]
 pub(crate) fn trim_idle(force: bool) {
     let keep = if force {
         0
-    } else if crate::host::shared_memory_pressure() >= 2 {
-        16
     } else {
-        return;
+        let cap = idle_cap_now();
+        if cap >= IDLE_MOST.0 {
+            return;
+        }
+        cap
     };
     trim_idle_to(keep, force);
 }
@@ -342,7 +362,8 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        let cap = idle_cap_now();
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= cap {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -350,7 +371,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < cap && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
@@ -372,14 +393,15 @@ pub(crate) fn recycle_landed(lists: Vec<Detached>, ran: &[usize]) {
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         let held = host.take_held();
         retired_held.push((_state, _uploads, held));
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        let cap = idle_cap_now();
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= cap {
             crate::host::retire(host);
             continue;
         }
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < cap && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         } else {
