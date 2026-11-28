@@ -288,7 +288,7 @@ fn sweep() {
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);
     let min_gap = if shared_memory_pressure() >= 2
-        || available_physical_ram().is_some_and(|free| free < 2 * (1024 << 20))
+        || available_physical_ram().is_some_and(|free| free < 1024 << 20)
     {
         400
     } else {
@@ -1740,7 +1740,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
 /// Releases idle pooled scratch upload chunks when forced (OOM recovery) or
 /// under WDDM shared-memory / physical-RAM pressure.
 fn trim_scratch_pool(force: bool) {
-    const PRESSURE_RAM: u64 = 3 * (1024 << 20);
+    const PRESSURE_RAM: u64 = 1024 << 20;
     if !force
         && shared_memory_pressure() < 1
         && !available_physical_ram().is_some_and(|free| free < PRESSURE_RAM)
@@ -3178,6 +3178,12 @@ fn land() {
     for (lists, order) in landed {
         crate::list::recycle_landed(lists, &order);
     }
+    // Bury retired COM objects off the relay thread so WDDM Release calls
+    // never hold `line.settling = true` and stall `relay_wait`.
+    let finished = FINISHED.load(Ordering::Acquire);
+    if finished > 0 {
+        bury(finished);
+    }
 }
 
 /// The thread that settles the flights once the card has run them all
@@ -3367,6 +3373,143 @@ fn relay_worker() {
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
+    }
+}
+
+/// Groups piece indices by shadow pointer key while preserving exact
+/// chronological order within each shadow, then balances groups across up to
+/// `max_buckets` worker buckets (heaviest groups first).
+fn group_piece_indices_by_key(keys: &[usize], max_buckets: usize) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = Vec::new();
+    let mut by_key: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for (idx, &key) in keys.iter().enumerate() {
+        by_key
+            .entry(key)
+            .or_insert_with(|| {
+                order.push(key);
+                Vec::new()
+            })
+            .push(idx);
+    }
+    let mut groups: Vec<Vec<usize>> = order
+        .into_iter()
+        .filter_map(|k| by_key.remove(&k))
+        .collect();
+    let bucket_count = max_buckets.max(1).min(groups.len().max(1));
+    if bucket_count <= 1 {
+        return vec![(0..keys.len()).collect()];
+    }
+    // Longest-processing-time-first greedy balance across worker buckets.
+    groups.sort_by(|a, b| b.len().cmp(&a.len()));
+    let mut buckets: Vec<Vec<usize>> = (0..bucket_count).map(|_| Vec::new()).collect();
+    let mut loads = vec![0usize; bucket_count];
+    for group in groups {
+        let best = loads
+            .iter()
+            .enumerate()
+            .min_by_key(|&(_, &load)| load)
+            .map_or(0, |(i, _)| i);
+        loads[best] += group.len();
+        buckets[best].extend(group);
+    }
+    buckets.retain(|b| !b.is_empty());
+    buckets
+}
+
+/// Merges in-flight card-copy pieces into title memory, parallelizing across
+/// distinct `Shadow` buffers on the `wide` worker pool when `VICTORY_WIDE_MERGE=1`.
+fn merge_relay_inflight_pieces(
+    pieces: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64)],
+) -> (usize, u64) {
+    if pieces.is_empty() {
+        return (0, 0);
+    }
+    if wide_merge() && pieces.len() >= 8 {
+        let keys: Vec<usize> = pieces
+            .iter()
+            .map(|(shadow, ..)| std::sync::Arc::as_ptr(shadow) as usize)
+            .collect();
+        let threads = (crate::shadow::wide_worker_count() + 1).max(1);
+        let buckets = group_piece_indices_by_key(&keys, threads);
+        if buckets.len() >= 2 {
+            let written = std::sync::atomic::AtomicUsize::new(0);
+            let bytes = std::sync::atomic::AtomicU64::new(0);
+            let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = buckets
+                .iter()
+                .map(|bucket| {
+                    let written = &written;
+                    let bytes = &bytes;
+                    Box::new(move || {
+                        let mut title = Vec::new();
+                        let (mut w, mut b) = (0usize, 0u64);
+                        for &idx in bucket {
+                            let (shadow, lo, hi, at, after) = &pieces[idx];
+                            // SAFETY: inside the mapping of the slots (checked by
+                            // caller); the copy into it ran in the plan's flight.
+                            let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
+                            w += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
+                            b += (hi - lo) as u64;
+                        }
+                        written.fetch_add(w, Ordering::Relaxed);
+                        bytes.fetch_add(b, Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send + '_>
+                })
+                .collect();
+            crate::shadow::wide_scope(jobs);
+            return (
+                written.load(Ordering::Relaxed),
+                bytes.load(Ordering::Relaxed),
+            );
+        }
+    }
+    let mut title = Vec::new();
+    let (mut written, mut bytes) = (0usize, 0u64);
+    for (shadow, lo, hi, at, after) in pieces {
+        // SAFETY: inside the mapping of the slots (checked by caller); the
+        // copy into it ran in the plan's flight, which the card has run.
+        let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
+        written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
+        bytes += (hi - lo) as u64;
+    }
+    (written, bytes)
+}
+
+#[cfg(test)]
+mod relay_merge_tests {
+    use super::group_piece_indices_by_key;
+
+    #[test]
+    fn groups_keep_each_shadow_in_one_bucket_and_preserve_order() {
+        let keys = [10, 20, 10, 30, 20, 10, 40, 30, 10];
+        let buckets = group_piece_indices_by_key(&keys, 3);
+        assert_eq!(buckets.len(), 3);
+        let mut seen = vec![false; keys.len()];
+        let mut key_bucket = std::collections::HashMap::new();
+        for (bi, bucket) in buckets.iter().enumerate() {
+            let mut last_for_key = std::collections::HashMap::new();
+            for &idx in bucket {
+                assert!(!seen[idx], "duplicate index {idx}");
+                seen[idx] = true;
+                let k = keys[idx];
+                if let Some(&prev_bi) = key_bucket.get(&k) {
+                    assert_eq!(prev_bi, bi, "shadow key {k} split across buckets");
+                } else {
+                    key_bucket.insert(k, bi);
+                }
+                if let Some(&prev_idx) = last_for_key.get(&k) {
+                    assert!(idx > prev_idx, "order inverted for key {k}: {idx} <= {prev_idx}");
+                }
+                last_for_key.insert(k, idx);
+            }
+        }
+        assert!(seen.into_iter().all(|x| x));
+    }
+
+    #[test]
+    fn single_shadow_stays_in_one_bucket() {
+        let keys = [42, 42, 42, 42];
+        let buckets = group_piece_indices_by_key(&keys, 4);
+        assert_eq!(buckets, vec![vec![0, 1, 2, 3]]);
     }
 }
 
@@ -4836,15 +4979,7 @@ impl Host {
         }
         // Outside the lock: no slot of these plans is written over before
         // their tickets are landed (`inflight_tickets_landed`, after this).
-        let mut title = Vec::new();
-        let (mut written, mut bytes) = (0, 0u64);
-        for (shadow, lo, hi, at, after) in &pieces {
-            // SAFETY: inside the mapping of the slots (checked above); the
-            // copy into it ran in the plan's flight, which the card has run.
-            let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
-            bytes += (hi - lo) as u64;
-        }
+        let (written, bytes) = merge_relay_inflight_pieces(&pieces);
         for plan in plans {
             for r in &plan.ranges {
                 crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
@@ -4943,7 +5078,6 @@ impl Host {
         }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
-            bury(last);
         }
         self.log_messages();
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);

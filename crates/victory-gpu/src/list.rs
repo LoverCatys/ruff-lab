@@ -291,10 +291,10 @@ const IDLE_WHEN_TIGHT: usize = 64;
 fn idle_cap_now() -> usize {
     let sp = crate::host::shared_memory_pressure();
     let avail = crate::host::available_physical_ram();
-    if sp >= 2 || avail.is_some_and(|free| free < 2 * (1024 << 20)) {
-        4
-    } else if sp >= 1 || avail.is_some_and(|free| free < 3 * (1024 << 20)) {
-        16
+    if sp >= 2 || avail.is_some_and(|free| free < 512 * (1024 << 10)) {
+        8
+    } else if sp >= 1 || avail.is_some_and(|free| free < 1024 << 20) {
+        32
     } else {
         IDLE_MOST.0
     }
