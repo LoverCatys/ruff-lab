@@ -1341,6 +1341,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    // Remapped physical views start read-write: clear any stale GPU-RO mark.
+    crate::shadow::title_memory_gpu_writable(at, len);
     let mut g = guards();
     // A mapping commits what was a placeholder: the runs over it are asked again.
     g.uncommitted.forget(at, at.saturating_add(len));

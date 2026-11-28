@@ -61,6 +61,36 @@ const PAGES_64K: u32 = PAGES_2M | PAGES_64K_BIT;
 /// adds GPU access bits (0x800-0x40000). Write-combining and uncached are
 /// dropped too: our GPU side reads this memory through the CPU.
 const HOST_PROTECTION: u32 = 0x1ff;
+/// Xbox GDK GPU page-protection bits (`VIctory-NVIDIA#1014`).
+const PAGE_GRAPHICS_READONLY: u32 = 0x0000_1000;
+const PAGE_GRAPHICS_READWRITE: u32 = 0x0000_2000;
+const PAGE_GRAPHICS_EXECUTE: u32 = 0x0000_4000;
+const PAGE_GRAPHICS_EXECUTE_READ: u32 = 0x0000_8000;
+const PAGE_GRAPHICS_EXECUTE_READWRITE: u32 = 0x0001_0000;
+const PAGE_GRAPHICS_RO_MASK: u32 =
+    PAGE_GRAPHICS_READONLY | PAGE_GRAPHICS_EXECUTE | PAGE_GRAPHICS_EXECUTE_READ;
+const PAGE_GRAPHICS_RW_MASK: u32 = PAGE_GRAPHICS_READWRITE | PAGE_GRAPHICS_EXECUTE_READWRITE;
+const HOST_PAGE: usize = 4096;
+
+fn page_aligned_range(at: usize, size: usize) -> Option<(usize, usize)> {
+    if at == 0 || size == 0 {
+        return None;
+    }
+    let start = at & !(HOST_PAGE - 1);
+    let end = at.checked_add(size)?.checked_next_multiple_of(HOST_PAGE)?;
+    Some((start, end - start))
+}
+
+fn note_gpu_protection(at: usize, size: usize, asked: u32) {
+    let Some((start, len)) = page_aligned_range(at, size) else {
+        return;
+    };
+    if asked & PAGE_GRAPHICS_RO_MASK != 0 && asked & PAGE_GRAPHICS_RW_MASK == 0 {
+        victory_gpu::title_memory_gpu_readonly(start, len);
+    } else if asked & PAGE_GRAPHICS_RW_MASK != 0 {
+        victory_gpu::title_memory_gpu_writable(start, len);
+    }
+}
 /// XMem flags of memory both processors reach: all of ours.
 const GRAPHICS: u64 = 3;
 /// XMem flag bit of 32-bit graphics memory.
@@ -101,6 +131,7 @@ pub extern "system" fn XMemVirtualAlloc(
             0
         },
     };
+    let asked = protect;
     let mut protect = match protect & HOST_PROTECTION {
         0 => PAGE_NOACCESS,
         p => p,
@@ -114,6 +145,7 @@ pub extern "system" fn XMemVirtualAlloc(
     if placeholder {
         if kind & MEM_REPLACE_PLACEHOLDER != 0 {
             // Part of a placeholder the title split: it stays one.
+            note_gpu_protection(base as usize, size, asked);
             return base;
         }
         protect = PAGE_NOACCESS;
@@ -153,6 +185,14 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if !at.is_null() {
+        if kind & MEM_RESERVE != 0
+            && let Some((page_at, page_size)) = page_aligned_range(at as usize, size)
+        {
+            victory_gpu::title_memory_gpu_writable(page_at, page_size);
+        }
+        note_gpu_protection(at as usize, size, asked);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -433,6 +473,11 @@ fn lean_remaps() -> bool {
 /// skipped; logged now and then.
 static LEAN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// The first physical page number handed to titles; 0 stays unused.
+const FIRST_PAGE: usize = 0x10_0000;
+/// Numbers from here on overflow the title's 21-bit `number >> 4` (`FRAMES`).
+const PAGE_LIMIT: usize = 1 << 25;
+
 #[derive(Default)]
 struct Physical {
     next_page: usize,
@@ -447,10 +492,45 @@ struct Physical {
     shown: HashMap<(usize, usize), Vec<usize>>,
 }
 
+impl Physical {
+    /// The first of `n` numbers, [`FRAMES`] apart, for new pages: after the
+    /// last given while they fit the title's 21 bits, then the lowest run of
+    /// `n` freed ones (`Vice-Tay#409`). `None` if no such run exists.
+    fn take_pages(&mut self, n: usize) -> Option<usize> {
+        let len = n.checked_mul(FRAMES)?;
+        let end = self.next_page.checked_add(len);
+        if let Some(end) = end.filter(|&end| end <= PAGE_LIMIT) {
+            let first = self.next_page;
+            self.next_page = end;
+            return Some(first);
+        }
+        static REUSING: std::sync::Once = std::sync::Once::new();
+        REUSING.call_once(|| {
+            tracing::info!("page numbers reach the title's 21 bits: freed ones given again");
+        });
+        let mut used: Vec<usize> = self.pages.keys().copied().collect();
+        used.sort_unstable();
+        free_run(used, len)
+    }
+}
+
+/// The lowest `start` from [`FIRST_PAGE`] where `len` (a multiple of
+/// [`FRAMES`]) numbers up to [`PAGE_LIMIT`] are all outside sorted `used`.
+fn free_run(used: impl IntoIterator<Item = usize>, len: usize) -> Option<usize> {
+    let mut start = FIRST_PAGE;
+    for at in used.into_iter().chain([PAGE_LIMIT]) {
+        if at.checked_sub(start).is_some_and(|gap| gap >= len) {
+            return Some(start);
+        }
+        start = start.max(at.checked_add(FRAMES)?);
+    }
+    None
+}
+
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
     Mutex::new(Physical {
         // Page numbers are opaque to titles; 0 stays unused.
-        next_page: 0x10_0000,
+        next_page: FIRST_PAGE,
         ..Default::default()
     })
 });
@@ -508,8 +588,13 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     let section = Arc::new(Section::new(handle, n));
     let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
+    let Some(first) = physical.take_pages(n) else {
+        drop(physical);
+        tracing::warn!(n, "XMemAllocatePhysicalPages: out of 21-bit page numbers");
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
+        return 0;
+    };
     for index in 0..n {
         let slice = Slice {
             section: section.clone(),
@@ -1640,5 +1725,25 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn page_numbers_freed_are_given_again_past_the_title_s_21_bits() {
+        let mut table = Physical {
+            next_page: PAGE_LIMIT - 2 * FRAMES,
+            ..Default::default()
+        };
+        assert_eq!(table.take_pages(2), Some(PAGE_LIMIT - 2 * FRAMES));
+        assert_eq!(table.next_page, PAGE_LIMIT);
+        assert_eq!(table.take_pages(3), Some(FIRST_PAGE));
+        assert_eq!(table.take_pages(usize::MAX), None);
+        let f = |k: usize| FIRST_PAGE + k * FRAMES;
+        assert_eq!(free_run([f(0), f(1), f(3)], FRAMES), Some(f(2)));
+        assert_eq!(free_run([f(0), f(1), f(3)], 2 * FRAMES), Some(f(4)));
+        assert_eq!(free_run([], PAGE_LIMIT - FIRST_PAGE), Some(FIRST_PAGE));
+        assert_eq!(free_run([f(0)], PAGE_LIMIT - FIRST_PAGE), None);
+        assert_eq!(free_run([], PAGE_LIMIT - FIRST_PAGE + FRAMES), None);
+        let p = free_run([PAGE_LIMIT - FRAMES], FRAMES).unwrap();
+        assert_eq!(((p >> 4) & 0x1f_ffff) << 4, p);
     }
 }
